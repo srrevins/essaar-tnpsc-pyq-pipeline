@@ -17,14 +17,16 @@ No Gemini, OpenAI, Cloud Vision, paid OCR, or other paid API is called.
 
 ## Background schedule
 
-The GitHub Actions workflow runs daily at 02:00 IST. It refreshes the official manifest, skips objects already present on Hugging Face, and processes at most three missing papers per run. The computer that created this repository does not need to remain online.
+GitHub Actions runs daily at 02:00 IST and restarts `essaar/essaar-tnpsc-pyq-worker` on free Hugging Face CPU Basic hardware. The Space uses the committed, validated official manifest, skips objects already present in the dataset, and processes at most three missing papers per boot. Your computer does not need to remain online. GitHub is only the scheduler because TNPSC blocks connections from GitHub-hosted runner IPs.
 
-The workflow can also be started manually from **Actions → TNPSC PYQ Background Pipeline → Run workflow**.
+The workflow can also be started manually from **Actions → TNPSC PYQ Background Pipeline → Run workflow**. A manual run deploys the worker code and restarts it; scheduled runs only restart the existing worker. The worker status is available at `https://essaar-essaar-tnpsc-pyq-worker.hf.space/status`.
 
 ## Required GitHub secrets
 
 - `HF_TOKEN`: fine-grained Hugging Face token with write access to the dataset.
 - `HF_DATASET_REPO`: `essaar/essaar-tnpsc-pyq`.
+
+The token is copied into the Space as a write-only secret during deployment; it is never committed to either public repository.
 
 ## Local commands
 

@@ -2,56 +2,41 @@ name: TNPSC PYQ Background Pipeline
 
 on:
   schedule:
-    # 20:30 UTC = 02:00 IST. Processes only missing files and stops after 3.
+    # 20:30 UTC = 02:00 IST. Restarts the free worker for one batch.
     - cron: '30 20 * * *'
   workflow_dispatch:
     inputs:
       limit:
         description: Maximum number of missing papers to process
         required: true
-        default: '3'
-      start:
-        description: Manifest index to start scanning from
-        required: true
-        default: '0'
-      force_ocr:
-        description: OCR every page instead of preferring embedded PDF text
-        required: true
-        type: boolean
-        default: false
+        default: '1'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: tnpsc-pyq-background
   cancel-in-progress: false
 
 jobs:
-  discover-archive-extract:
+  schedule-free-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+      HF_SPACE_REPO: essaar/essaar-tnpsc-pyq-worker
       PROCESS_LIMIT: ${{ inputs.limit || '3' }}
-      START_INDEX: ${{ inputs.start || '0' }}
-      FORCE_OCR: ${{ inputs.force_ocr || 'false' }}
 
     steps:
       - name: Checkout pipeline
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
-
-      - name: Install open-source OCR tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam
 
       - name: Install Python dependencies
         run: pip install --requirement requirements.txt
@@ -59,39 +44,28 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
+      - name: Validate committed official manifest
+        run: python pipeline.py validate --manifest data/manifest.json
+
       - name: Verify secrets
         run: |
           test -n "$HF_TOKEN" || (echo "::error::HF_TOKEN is missing" && exit 1)
           test -n "$HF_DATASET_REPO" || (echo "::error::HF_DATASET_REPO is missing" && exit 1)
 
-      - name: Refresh collision-safe official manifest
-        run: python pipeline.py discover --output data/manifest.json
+      - name: Deploy free Hugging Face worker
+        if: github.event_name == 'workflow_dispatch'
+        run: python deploy_space.py
 
-      - name: Validate manifest
-        run: python pipeline.py validate --manifest data/manifest.json
-
-      - name: Upload and extract next missing papers
+      - name: Restart free Hugging Face worker
+        if: github.event_name == 'schedule'
         run: |
-          extra_args=""
-          if [ "$FORCE_OCR" = "true" ]; then extra_args="--force-ocr"; fi
-          python pipeline.py sync --manifest data/manifest.json --limit "$PROCESS_LIMIT" --start "$START_INDEX" $extra_args
-
-      - name: Commit refreshed manifest
-        run: |
-          if git diff --quiet -- data/manifest.json; then
-            echo "Manifest unchanged."
-            exit 0
-          fi
-          git config user.name "essaar-pyq-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add data/manifest.json
-          git commit -m "data: refresh official TNPSC PYQ manifest"
-          git push
+          python -c "import os; from huggingface_hub import HfApi; a=HfApi(token=os.environ['HF_TOKEN']); a.add_space_variable(os.environ['HF_SPACE_REPO'], 'PROCESS_LIMIT', os.environ['PROCESS_LIMIT']); a.restart_space(os.environ['HF_SPACE_REPO']); print('Worker restarted')"
 
       - name: Job summary
         if: always()
         run: |
-          echo "### TNPSC PYQ pipeline" >> "$GITHUB_STEP_SUMMARY"
+          echo "### TNPSC PYQ scheduler" >> "$GITHUB_STEP_SUMMARY"
           echo "- Paid APIs used: **none**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Worker: **$HF_SPACE_REPO** (free CPU Basic)" >> "$GITHUB_STEP_SUMMARY"
           echo "- Requested paper limit: **$PROCESS_LIMIT**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Hugging Face dataset: **$HF_DATASET_REPO**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Dataset: **$HF_DATASET_REPO**" >> "$GITHUB_STEP_SUMMARY"
