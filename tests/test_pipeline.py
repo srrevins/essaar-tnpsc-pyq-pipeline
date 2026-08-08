@@ -50,6 +50,47 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(objective, ("Group IV Services", 2024, "Preliminary", "objective"))
         self.assertEqual(mains, ("Group I", 2023, "Mains", "descriptive"))
 
+    def test_structured_question_layouts_preserve_raw_lines(self):
+        assertion = pipeline.question_layout(
+            "Assertion (A): The Constitution is supreme.\nReason (R): All laws derive authority from it."
+        )
+        matching = pipeline.question_layout(
+            "Match the following:\n1. Article 14    A. Equality\n2. Article 21    B. Life and liberty"
+        )
+        statements = pipeline.question_layout(
+            "Consider the following statements:\n1. The RBI issues currency.\n2. SEBI regulates securities."
+        )
+        self.assertEqual(assertion["type"], "assertion_reason")
+        self.assertEqual(assertion["structured"]["assertion"], "The Constitution is supreme.")
+        self.assertEqual(matching["type"], "match_following")
+        self.assertEqual(len(matching["structured"]["parsedRows"]), 2)
+        self.assertEqual(statements["type"], "multiple_statement")
+        self.assertEqual([item["label"] for item in statements["structured"]["statements"]], ["1", "2"])
+        self.assertTrue(statements["preserveLineBreaks"])
+        self.assertEqual(len(statements["rawLines"]), 3)
+
+    def test_shards_select_non_overlapping_papers(self):
+        papers = [
+            pipeline.make_paper("Exam", 2020 + index, "Preliminary", "objective", "General Studies", f"https://example.test/{index}.pdf", "https://example.test", "test")
+            for index in range(4)
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(pipeline.manifest_payload(papers)), encoding="utf-8")
+
+            def fake_download(_session, _url, destination):
+                destination.write_bytes(b"%PDF-test")
+                return "abc123"
+
+            with mock.patch.object(pipeline, "download_pdf", side_effect=fake_download), mock.patch.object(pipeline, "extract_draft", return_value={"schemaVersion": 2, "questions": []}):
+                summary = pipeline.extract_missing_to_directory(manifest, root / "data", 10, 0, False, 1, 2)
+
+            self.assertEqual(summary["processed"], 2)
+            self.assertFalse((root / "data" / papers[0].draftPath).exists())
+            self.assertTrue((root / "data" / papers[1].draftPath).exists())
+            self.assertFalse((root / "data" / papers[2].draftPath).exists())
+            self.assertTrue((root / "data" / papers[3].draftPath).exists())
     def test_github_output_is_atomic_and_skips_existing(self):
         paper = pipeline.make_paper("Group IV", 2024, "Preliminary", "objective", "General Studies", "https://example.test/paper.pdf", "https://example.test", "test")
         with tempfile.TemporaryDirectory() as temp:

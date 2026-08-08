@@ -39,7 +39,8 @@ YEAR_RE = re.compile(r"\b(20(?:1[6-9]|2[0-6]))\b")
 GS_RE = re.compile(r"\b(?:general\s+stud(?:y|ies)|g\s*\.?\s*s\.?)\b", re.I)
 PDF_RE = re.compile(r"\.pdf(?:$|[?#])", re.I)
 QUESTION_RE = re.compile(r"(?m)^\s*(\d{1,3})\s*[.)]\s+")
-OPTION_RE = re.compile(r"(?m)^\s*(?:\(([A-D1-4])\)|([A-D1-4])\s*[.)])\s+")
+TOP_QUESTION_RE = re.compile(r"(?m)^[ \t]{0,4}(\d{1,3})\s*[.)]\s+")
+OPTION_RE = re.compile(r"(?m)^\s*(?:\(([A-D])\)|([A-D])\s*[.)])\s+")
 MARK_RE = re.compile(r"[✓✔☑√]")
 
 ARCHIVE_URLS = (
@@ -472,7 +473,9 @@ def download_pdf(session: requests.Session, url: str, destination: Path) -> str:
         if not first.startswith(b"%PDF-"):
             raise ValueError("URL did not return a PDF")
         with destination.open("wb") as handle:
-            for chunk in (first, *iterator):
+            handle.write(first)
+            digest.update(first)
+            for chunk in iterator:
                 if chunk:
                     handle.write(chunk)
                     digest.update(chunk)
@@ -559,13 +562,82 @@ def detect_language(text: str) -> str:
     return "unknown"
 
 
+STATEMENT_LINE_RE = re.compile(r"^\s*(\(?[0-9IVXivx]+\)?)[.)-]\s+(.+?)\s*$")
+MATCH_ROW_RE = re.compile(
+    r"^\s*(\(?[A-Za-z0-9]+\)?)[.)-]?\s+(.+?)\s{4,}[.]?\s*(\(?[A-Za-z0-9]+\)?)[.)-]?\s+(.+?)\s*$"
+)
+
+
+def question_layout(question_text: str) -> dict:
+    raw_lines = [line.rstrip() for line in question_text.splitlines()]
+    display_lines = [line.strip() for line in raw_lines if line.strip()]
+    joined = "\n".join(display_lines)
+    folded = joined.casefold()
+    question_type = "standard"
+    structured: dict = {}
+
+    assertion_match = re.search(
+        r"(?is)(?:\bassertion(?:\s*\([aA]\))?|கூற்று)\s*[:.-]\s*(.+?)"
+        r"(?=(?:\breason(?:\s*\([rR]\))?|காரணம்)\s*[:.-])",
+        joined,
+    )
+    reason_match = re.search(
+        r"(?is)(?:\breason(?:\s*\([rR]\))?|காரணம்)\s*[:.-]\s*(.+)$",
+        joined,
+    )
+    if assertion_match and reason_match:
+        question_type = "assertion_reason"
+        structured = {
+            "assertion": assertion_match.group(1).strip(),
+            "reason": reason_match.group(1).strip(),
+        }
+    elif any(marker in folded for marker in ("match the following", "match the pairs", "list i", "list-i", "பொருத்துக")):
+        question_type = "match_following"
+        parsed_rows = []
+        for line in display_lines:
+            row = MATCH_ROW_RE.match(line)
+            if row:
+                left_text = row.group(2).strip()
+                right_text = row.group(4).strip()
+                if re.fullmatch(r"\(?[A-Za-z0-9]+\)?", left_text) and re.fullmatch(r"\(?[A-Za-z0-9]+\)?", right_text):
+                    continue
+                parsed_rows.append(
+                    {
+                        "leftLabel": row.group(1).strip("()"),
+                        "leftText": left_text,
+                        "rightLabel": row.group(3).strip("()"),
+                        "rightText": right_text,
+                    }
+                )
+        structured = {"parsedRows": parsed_rows, "rawRows": display_lines}
+    else:
+        statements = []
+        for line in display_lines:
+            statement = STATEMENT_LINE_RE.match(line)
+            if statement:
+                statements.append(
+                    {"label": statement.group(1).strip("()"), "text": statement.group(2).strip()}
+                )
+        if len(statements) >= 2:
+            question_type = "multiple_statement"
+            structured = {"statements": statements}
+
+    return {
+        "version": 1,
+        "type": question_type,
+        "displayMode": "preformatted",
+        "preserveLineBreaks": True,
+        "rawText": question_text,
+        "rawLines": raw_lines,
+        "structured": structured,
+    }
 def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
     tags = load_tags()
     questions: list[dict] = []
     seen_numbers: set[int] = set()
     for page in pages:
         text = page["text"]
-        matches = list(QUESTION_RE.finditer(text))
+        matches = list(TOP_QUESTION_RE.finditer(text)) or list(QUESTION_RE.finditer(text))
         for index, match in enumerate(matches):
             number = int(match.group(1))
             if number < 1 or number > 250 or number in seen_numbers:
@@ -586,6 +658,7 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
                 if MARK_RE.search(value) or MARK_RE.search(option_match.group(0)):
                     marked = canonical
                 options.append({"label": canonical, "text": MARK_RE.sub("", value).strip()})
+            layout = question_layout(question_text)
             language = detect_language(question_text)
             tag = tag_question(f"{question_text} {' '.join(item['text'] for item in options)}", tags)
             structure_confidence = 0.92 if len(options) == 4 else 0.55 if options else 0.3
@@ -600,6 +673,8 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
                     "questionTextRaw": question_text,
                     "questionTextEn": question_text if language in {"en", "bilingual"} else "",
                     "questionTextTa": question_text if language in {"ta", "bilingual"} else "",
+                    "questionType": layout["type"],
+                    "layout": layout,
                     "options": options,
                     "correctOption": marked,
                     "subject": tag["subject"],
@@ -623,7 +698,7 @@ def extract_draft(pdf_path: Path, paper: dict, sha256: str, force_ocr: bool = Fa
     pages, audit = extract_pages(pdf_path, force_ocr=force_ocr)
     questions = parse_questions(pages, paper)
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "paper": paper,
         "sourceSha256": sha256,
         "extraction": {
@@ -632,6 +707,7 @@ def extract_draft(pdf_path: Path, paper: dict, sha256: str, force_ocr: bool = Fa
             "answerCount": sum(bool(item["correctOption"]) for item in questions),
             "requiresHumanReview": True,
             "paidApiUsed": False,
+            "layoutPreserved": True,
         },
         "questions": questions,
     }
@@ -733,9 +809,13 @@ def extract_missing_to_directory(
     limit: int,
     start: int,
     force_ocr: bool,
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> dict:
+    if shard_count < 1 or shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("Invalid shard index/count")
     manifest = load_manifest(manifest_path)
-    selected = manifest["papers"][max(0, start):]
+    selected = manifest["papers"][max(0, start):][shard_index::shard_count]
     completed = skipped = failed = 0
     session = build_session()
     with tempfile.TemporaryDirectory() as temp:
@@ -778,6 +858,8 @@ def command_sync_github(args: argparse.Namespace) -> int:
         args.limit,
         args.start,
         args.force_ocr,
+        args.shard_index,
+        args.shard_count,
     )
     log(json.dumps(summary, indent=2))
     return 1 if summary["failed"] and not summary["processed"] else 0
@@ -850,6 +932,8 @@ def parser() -> argparse.ArgumentParser:
     github.add_argument("--limit", type=int, default=3)
     github.add_argument("--start", type=int, default=0)
     github.add_argument("--force-ocr", action="store_true")
+    github.add_argument("--shard-index", type=int, default=0)
+    github.add_argument("--shard-count", type=int, default=1)
     github.set_defaults(handler=command_sync_github)
     return root
 

@@ -17,7 +17,7 @@ No Gemini, OpenAI, Cloud Vision, paid OCR, or other paid API is called.
 
 ## Background schedule
 
-GitHub Actions runs daily at 02:00 IST on free standard runners for this public repository. It reads the verified 184-file GitHub Release mirror, skips drafts already committed to GitHub, and processes at most three missing papers per run. Your computer does not need to remain online. The mirror is used because TNPSC blocks connections from GitHub-hosted runner IPs.
+GitHub Actions retains a daily 02:00 IST maintenance run for newly missing papers. Initial or replacement backfills use 16 non-overlapping workers in parallel, up to 12 papers each, followed by one conflict-free aggregation commit. Your computer does not need to remain online. The verified GitHub Release mirror is used because TNPSC blocks connections from GitHub-hosted runner IPs.
 
 The workflow can also be started manually from **Actions → TNPSC PYQ Background Pipeline → Run workflow**. Use a limit of `1` for a smoke test and `3` for the normal background batch.
 
@@ -51,6 +51,9 @@ Extract the next three missing mirrored papers into versioned GitHub drafts:
 python pipeline.py sync-github --manifest data/mirror_manifest.json --output-root data --limit 3
 ```
 
+## Structured layout
+
+Draft schema v2 retains `rawText`, ordered `rawLines`, and `preserveLineBreaks: true` for every question. It also emits structured fields for `assertion_reason`, `match_following`, and `multiple_statement` layouts. Website renderers should use preformatted line wrapping as the source-of-truth fallback and use the structured fields for accessible tables or statement blocks.
 ## Safety and quality
 
 - PDFs are accepted only when the downloaded bytes begin with `%PDF-`.

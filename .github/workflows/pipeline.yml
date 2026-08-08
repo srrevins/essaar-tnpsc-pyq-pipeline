@@ -2,18 +2,23 @@ name: TNPSC PYQ Background Pipeline
 
 on:
   schedule:
-    # 20:30 UTC = 02:00 IST. Processes only missing mirrored papers.
+    # Daily maintenance after the accelerated backfill is complete.
     - cron: '30 20 * * *'
   workflow_dispatch:
     inputs:
-      limit:
-        description: Maximum number of missing papers to process
+      full_backfill:
+        description: Process the complete backlog with 16 parallel workers
         required: true
-        default: '1'
-      start:
-        description: Mirror-manifest index to start scanning from
+        type: boolean
+        default: false
+      incremental_limit:
+        description: Papers for a normal single-worker run
         required: true
-        default: '0'
+        default: '3'
+      limit_per_shard:
+        description: Maximum papers per worker during full backfill
+        required: true
+        default: '12'
       force_ocr:
         description: OCR every page instead of preferring embedded PDF text
         required: true
@@ -28,61 +33,106 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  extract-mirrored-papers:
+  incremental:
+    if: ${{ github.event_name == 'schedule' || inputs.full_backfill != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      PROCESS_LIMIT: ${{ inputs.limit || '3' }}
-      START_INDEX: ${{ inputs.start || '0' }}
+      PROCESS_LIMIT: ${{ inputs.incremental_limit || '3' }}
       FORCE_OCR: ${{ inputs.force_ocr || 'false' }}
-
     steps:
-      - name: Checkout pipeline
-        uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
-
-      - name: Install open-source OCR tools
+      - name: Install OCR and Python dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam
-
-      - name: Install Python dependencies
-        run: pip install --requirement requirements.txt
-
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-
-      - name: Validate release-mirror manifest
-        run: python pipeline.py validate --manifest data/mirror_manifest.json
-
-      - name: Extract next missing mirrored papers
+          pip install --requirement requirements.txt
+      - name: Test and validate
+        run: |
+          python -m unittest discover -s tests -v
+          python pipeline.py validate --manifest data/mirror_manifest.json
+      - name: Extract next missing papers
         run: |
           extra_args=""
           if [ "$FORCE_OCR" = "true" ]; then extra_args="--force-ocr"; fi
-          python pipeline.py sync-github --manifest data/mirror_manifest.json --output-root data --limit "$PROCESS_LIMIT" --start "$START_INDEX" $extra_args
-
+          python pipeline.py sync-github --manifest data/mirror_manifest.json --output-root data --limit "$PROCESS_LIMIT" $extra_args
       - name: Commit compressed review drafts
         run: |
-          if [ -z "$(git status --porcelain -- data/drafts)" ]; then
-            echo "No new drafts."
-            exit 0
-          fi
+          if [ -z "$(git status --porcelain -- data/drafts)" ]; then echo "No new drafts."; exit 0; fi
           git config user.name "essaar-pyq-bot"
           git config user.email "actions@users.noreply.github.com"
           git add data/drafts
-          git commit -m "data: add TNPSC extraction drafts"
+          git commit -m "data: add TNPSC layout-preserving drafts"
           git push
 
-      - name: Job summary
-        if: always()
+  backfill:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_backfill == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    env:
+      PROCESS_LIMIT: ${{ inputs.limit_per_shard }}
+      FORCE_OCR: ${{ inputs.force_ocr }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install OCR and Python dependencies
         run: |
-          echo "### TNPSC PYQ pipeline" >> "$GITHUB_STEP_SUMMARY"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam
+          pip install --requirement requirements.txt
+      - name: Test and validate
+        run: |
+          python -m unittest discover -s tests -v
+          python pipeline.py validate --manifest data/mirror_manifest.json
+      - name: Extract shard ${{ matrix.shard }}
+        run: |
+          extra_args=""
+          if [ "$FORCE_OCR" = "true" ]; then extra_args="--force-ocr"; fi
+          python pipeline.py sync-github --manifest data/mirror_manifest.json --output-root shard-output --limit "$PROCESS_LIMIT" --shard-index "${{ matrix.shard }}" --shard-count 16 $extra_args
+      - name: Upload shard drafts
+        uses: actions/upload-artifact@v7
+        with:
+          name: drafts-${{ matrix.shard }}
+          path: shard-output/drafts
+          if-no-files-found: error
+          retention-days: 1
+
+  commit-backfill:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_backfill == true }}
+    needs: backfill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download and merge all draft shards
+        uses: actions/download-artifact@v8
+        with:
+          pattern: drafts-*
+          path: data/drafts
+          merge-multiple: true
+      - name: Commit complete layout-preserving backfill
+        run: |
+          git config user.name "essaar-pyq-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/drafts
+          if git diff --cached --quiet; then echo "No draft changes."; exit 0; fi
+          git commit -m "data: complete accelerated TNPSC layout backfill"
+          git push
+      - name: Backfill summary
+        run: |
+          echo "### Accelerated TNPSC PYQ backfill" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Parallel workers: **16**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Paid APIs used: **none**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Source: **verified GitHub Release mirror**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Output: **versioned compressed GitHub drafts**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Requested paper limit: **$PROCESS_LIMIT**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Layout schema: **v2**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Assertion-reason, matching, multi-statement, and raw line layout retained." >> "$GITHUB_STEP_SUMMARY"
