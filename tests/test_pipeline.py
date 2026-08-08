@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import build_mirror_manifest
 import pipeline
 
 
@@ -35,6 +36,15 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(papers), 1)
         self.assertEqual(papers[0].stage, "Preliminary")
         self.assertEqual(papers[0].paperType, "objective")
+    def test_release_filename_metadata(self):
+        objective = build_mirror_manifest.metadata_from_filename(
+            "TNPSC_Group_IV_Services_Objective_2024_GS.pdf"
+        )
+        mains = build_mirror_manifest.metadata_from_filename(
+            "TNPSC_Group_I_Main_Written_Examination_2023_GS.pdf"
+        )
+        self.assertEqual(objective, ("Group IV Services", 2024, "Preliminary", "objective"))
+        self.assertEqual(mains, ("Group I", 2023, "Mains", "descriptive"))
     def test_manifest_validation_rejects_duplicate_url(self):
         paper = pipeline.make_paper("Group I", 2024, "Preliminary", "objective", "General Studies", "https://example.test/paper.pdf", "https://example.test", "test")
         payload = pipeline.manifest_payload([paper, paper])

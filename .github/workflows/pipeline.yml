@@ -2,7 +2,7 @@ name: TNPSC PYQ Background Pipeline
 
 on:
   schedule:
-    # 20:30 UTC = 02:00 IST. Restarts the free worker for one batch.
+    # 20:30 UTC = 02:00 IST. Processes only missing mirrored papers.
     - cron: '30 20 * * *'
   workflow_dispatch:
     inputs:
@@ -10,6 +10,15 @@ on:
         description: Maximum number of missing papers to process
         required: true
         default: '1'
+      start:
+        description: Mirror-manifest index to start scanning from
+        required: true
+        default: '0'
+      force_ocr:
+        description: OCR every page instead of preferring embedded PDF text
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,14 +28,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  schedule-free-worker:
+  extract-mirrored-papers:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
-      HF_SPACE_REPO: essaar/essaar-tnpsc-pyq-worker
       PROCESS_LIMIT: ${{ inputs.limit || '3' }}
+      START_INDEX: ${{ inputs.start || '0' }}
+      FORCE_OCR: ${{ inputs.force_ocr || 'false' }}
 
     steps:
       - name: Checkout pipeline
@@ -38,34 +48,36 @@ jobs:
           python-version: '3.12'
           cache: pip
 
+      - name: Install open-source OCR tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam
+
       - name: Install Python dependencies
         run: pip install --requirement requirements.txt
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
-      - name: Validate committed official manifest
-        run: python pipeline.py validate --manifest data/manifest.json
+      - name: Validate release-mirror manifest
+        run: python pipeline.py validate --manifest data/mirror_manifest.json
 
       - name: Verify secrets
         run: |
           test -n "$HF_TOKEN" || (echo "::error::HF_TOKEN is missing" && exit 1)
           test -n "$HF_DATASET_REPO" || (echo "::error::HF_DATASET_REPO is missing" && exit 1)
 
-      - name: Deploy free Hugging Face worker
-        if: github.event_name == 'workflow_dispatch'
-        run: python deploy_space.py
-
-      - name: Restart free Hugging Face worker
-        if: github.event_name == 'schedule'
+      - name: Upload and extract next missing mirrored papers
         run: |
-          python -c "import os; from huggingface_hub import HfApi; a=HfApi(token=os.environ['HF_TOKEN']); a.add_space_variable(os.environ['HF_SPACE_REPO'], 'PROCESS_LIMIT', os.environ['PROCESS_LIMIT']); a.restart_space(os.environ['HF_SPACE_REPO']); print('Worker restarted')"
+          extra_args=""
+          if [ "$FORCE_OCR" = "true" ]; then extra_args="--force-ocr"; fi
+          python pipeline.py sync --manifest data/mirror_manifest.json --limit "$PROCESS_LIMIT" --start "$START_INDEX" $extra_args
 
       - name: Job summary
         if: always()
         run: |
-          echo "### TNPSC PYQ scheduler" >> "$GITHUB_STEP_SUMMARY"
+          echo "### TNPSC PYQ pipeline" >> "$GITHUB_STEP_SUMMARY"
           echo "- Paid APIs used: **none**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Worker: **$HF_SPACE_REPO** (free CPU Basic)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: **verified GitHub Release mirror**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Requested paper limit: **$PROCESS_LIMIT**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Dataset: **$HF_DATASET_REPO**" >> "$GITHUB_STEP_SUMMARY"

@@ -17,16 +17,16 @@ No Gemini, OpenAI, Cloud Vision, paid OCR, or other paid API is called.
 
 ## Background schedule
 
-GitHub Actions runs daily at 02:00 IST and restarts `essaar/essaar-tnpsc-pyq-worker` on free Hugging Face CPU Basic hardware. The Space uses the committed, validated official manifest, skips objects already present in the dataset, and processes at most three missing papers per boot. Your computer does not need to remain online. GitHub is only the scheduler because TNPSC blocks connections from GitHub-hosted runner IPs.
+GitHub Actions runs daily at 02:00 IST on free standard runners for this public repository. It reads the verified 184-file GitHub Release mirror, skips objects already present in Hugging Face, and processes at most three missing papers per run. Your computer does not need to remain online. The mirror is used because TNPSC blocks connections from GitHub-hosted runner IPs.
 
-The workflow can also be started manually from **Actions → TNPSC PYQ Background Pipeline → Run workflow**. A manual run deploys the worker code and restarts it; scheduled runs only restart the existing worker. The worker status is available at `https://essaar-essaar-tnpsc-pyq-worker.hf.space/status`.
+The workflow can also be started manually from **Actions → TNPSC PYQ Background Pipeline → Run workflow**. Use a limit of `1` for a smoke test and `3` for the normal background batch.
 
 ## Required GitHub secrets
 
 - `HF_TOKEN`: fine-grained Hugging Face token with write access to the dataset.
 - `HF_DATASET_REPO`: `essaar/essaar-tnpsc-pyq`.
 
-The token is copied into the Space as a write-only secret during deployment; it is never committed to either public repository.
+The token remains an encrypted GitHub Actions secret and is never committed to the public repository.
 
 ## Local commands
 
@@ -35,6 +35,7 @@ python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 python pipeline.py discover --output data/manifest.json
 python pipeline.py validate --manifest data/manifest.json
+python pipeline.py validate --manifest data/mirror_manifest.json
 ```
 
 Extract a known local PDF:
@@ -51,7 +52,7 @@ Sync the next three missing papers to Hugging Face:
 
 ```bash
 HF_TOKEN=... HF_DATASET_REPO=essaar/essaar-tnpsc-pyq \
-python pipeline.py sync --limit 3
+python pipeline.py sync --manifest data/mirror_manifest.json --limit 3
 ```
 
 ## Safety and quality
