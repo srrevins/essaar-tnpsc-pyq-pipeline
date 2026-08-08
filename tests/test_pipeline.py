@@ -1,7 +1,10 @@
+import gzip
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -36,6 +39,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(papers), 1)
         self.assertEqual(papers[0].stage, "Preliminary")
         self.assertEqual(papers[0].paperType, "objective")
+
     def test_release_filename_metadata(self):
         objective = build_mirror_manifest.metadata_from_filename(
             "TNPSC_Group_IV_Services_Objective_2024_GS.pdf"
@@ -45,6 +49,29 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(objective, ("Group IV Services", 2024, "Preliminary", "objective"))
         self.assertEqual(mains, ("Group I", 2023, "Mains", "descriptive"))
+
+    def test_github_output_is_atomic_and_skips_existing(self):
+        paper = pipeline.make_paper("Group IV", 2024, "Preliminary", "objective", "General Studies", "https://example.test/paper.pdf", "https://example.test", "test")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(pipeline.manifest_payload([paper])), encoding="utf-8")
+
+            def fake_download(_session, _url, destination):
+                destination.write_bytes(b"%PDF-test")
+                return "abc123"
+
+            fake_draft = {"schemaVersion": 1, "questions": [], "paper": pipeline.asdict(paper)}
+            with mock.patch.object(pipeline, "download_pdf", side_effect=fake_download), mock.patch.object(pipeline, "extract_draft", return_value=fake_draft):
+                first = pipeline.extract_missing_to_directory(manifest, root / "data", 1, 0, False)
+                second = pipeline.extract_missing_to_directory(manifest, root / "data", 1, 0, False)
+
+            output = root / "data" / paper.draftPath
+            self.assertEqual(first["processed"], 1)
+            self.assertEqual(second["skippedExisting"], 1)
+            self.assertEqual(json.loads(gzip.decompress(output.read_bytes())), fake_draft)
+            self.assertFalse(output.with_suffix(output.suffix + ".part").exists())
+
     def test_manifest_validation_rejects_duplicate_url(self):
         paper = pipeline.make_paper("Group I", 2024, "Preliminary", "objective", "General Studies", "https://example.test/paper.pdf", "https://example.test", "test")
         payload = pipeline.manifest_payload([paper, paper])

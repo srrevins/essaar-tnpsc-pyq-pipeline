@@ -21,7 +21,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: tnpsc-pyq-background
@@ -32,8 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
       PROCESS_LIMIT: ${{ inputs.limit || '3' }}
       START_INDEX: ${{ inputs.start || '0' }}
       FORCE_OCR: ${{ inputs.force_ocr || 'false' }}
@@ -62,16 +60,23 @@ jobs:
       - name: Validate release-mirror manifest
         run: python pipeline.py validate --manifest data/mirror_manifest.json
 
-      - name: Verify secrets
-        run: |
-          test -n "$HF_TOKEN" || (echo "::error::HF_TOKEN is missing" && exit 1)
-          test -n "$HF_DATASET_REPO" || (echo "::error::HF_DATASET_REPO is missing" && exit 1)
-
-      - name: Upload and extract next missing mirrored papers
+      - name: Extract next missing mirrored papers
         run: |
           extra_args=""
           if [ "$FORCE_OCR" = "true" ]; then extra_args="--force-ocr"; fi
-          python pipeline.py sync --manifest data/mirror_manifest.json --limit "$PROCESS_LIMIT" --start "$START_INDEX" $extra_args
+          python pipeline.py sync-github --manifest data/mirror_manifest.json --output-root data --limit "$PROCESS_LIMIT" --start "$START_INDEX" $extra_args
+
+      - name: Commit compressed review drafts
+        run: |
+          if [ -z "$(git status --porcelain -- data/drafts)" ]; then
+            echo "No new drafts."
+            exit 0
+          fi
+          git config user.name "essaar-pyq-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/drafts
+          git commit -m "data: add TNPSC extraction drafts"
+          git push
 
       - name: Job summary
         if: always()
@@ -79,5 +84,5 @@ jobs:
           echo "### TNPSC PYQ pipeline" >> "$GITHUB_STEP_SUMMARY"
           echo "- Paid APIs used: **none**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source: **verified GitHub Release mirror**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Output: **versioned compressed GitHub drafts**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Requested paper limit: **$PROCESS_LIMIT**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Dataset: **$HF_DATASET_REPO**" >> "$GITHUB_STEP_SUMMARY"

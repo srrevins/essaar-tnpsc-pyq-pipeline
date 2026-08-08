@@ -727,6 +727,60 @@ def sync_missing(manifest_path: Path, limit: int, start: int, force_ocr: bool) -
     return {"processed": completed, "skippedExisting": skipped, "failed": failed}
 
 
+def extract_missing_to_directory(
+    manifest_path: Path,
+    output_root: Path,
+    limit: int,
+    start: int,
+    force_ocr: bool,
+) -> dict:
+    manifest = load_manifest(manifest_path)
+    selected = manifest["papers"][max(0, start):]
+    completed = skipped = failed = 0
+    session = build_session()
+    with tempfile.TemporaryDirectory() as temp:
+        temp_dir = Path(temp)
+        for paper in selected:
+            if completed >= limit:
+                break
+            draft_path = output_root / paper["draftPath"]
+            if draft_path.is_file() and draft_path.stat().st_size > 0:
+                skipped += 1
+                continue
+            pdf_path = temp_dir / f"{paper['id']}.pdf"
+            partial = draft_path.with_suffix(draft_path.suffix + ".part")
+            try:
+                log(f"Processing {paper['year']} | {paper['examName']} | {paper['subject']}")
+                sha256 = download_pdf(session, paper["officialPdfUrl"], pdf_path)
+                draft = extract_draft(pdf_path, paper, sha256, force_ocr=force_ocr)
+                compressed = gzip.compress(
+                    (json.dumps(draft, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"),
+                    compresslevel=9,
+                )
+                draft_path.parent.mkdir(parents=True, exist_ok=True)
+                partial.write_bytes(compressed)
+                partial.replace(draft_path)
+                completed += 1
+                log(f"Completed {paper['id']} -> {draft_path}")
+            except Exception as exc:
+                failed += 1
+                partial.unlink(missing_ok=True)
+                log(f"ERROR {paper['id']}: {exc}")
+            finally:
+                pdf_path.unlink(missing_ok=True)
+    return {"processed": completed, "skippedExisting": skipped, "failed": failed}
+
+
+def command_sync_github(args: argparse.Namespace) -> int:
+    summary = extract_missing_to_directory(
+        args.manifest,
+        args.output_root,
+        args.limit,
+        args.start,
+        args.force_ocr,
+    )
+    log(json.dumps(summary, indent=2))
+    return 1 if summary["failed"] and not summary["processed"] else 0
 def command_discover(args: argparse.Namespace) -> int:
     with build_session() as session:
         papers = discover_all(session)
@@ -790,6 +844,13 @@ def parser() -> argparse.ArgumentParser:
     sync.add_argument("--start", type=int, default=0)
     sync.add_argument("--force-ocr", action="store_true")
     sync.set_defaults(handler=command_sync)
+    github = commands.add_parser("sync-github", help="extract missing mirrored papers into the repository")
+    github.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    github.add_argument("--output-root", type=Path, default=ROOT / "data")
+    github.add_argument("--limit", type=int, default=3)
+    github.add_argument("--start", type=int, default=0)
+    github.add_argument("--force-ocr", action="store_true")
+    github.set_defaults(handler=command_sync_github)
     return root
 
 
