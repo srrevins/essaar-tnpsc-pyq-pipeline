@@ -2,8 +2,8 @@ name: TNPSC PYQ Background Pipeline
 
 on:
   schedule:
-    # Daily maintenance after the accelerated backfill is complete.
-    - cron: '30 20 * * *'
+    # Run every hour to continuously process and refine papers in background
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       full_backfill:
