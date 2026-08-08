@@ -1,0 +1,52 @@
+[
+  {
+    "unitId": "unit-1",
+    "subject": "General Science",
+    "keywords": ["physics", "chemistry", "biology", "science", "space", "isro", "disease", "cell", "energy", "environment", "ecology", "இயற்பியல்", "வேதியியல்", "உயிரியல்", "அறிவியல்", "சுற்றுச்சூழல்"]
+  },
+  {
+    "unitId": "unit-2",
+    "subject": "Current Events",
+    "keywords": ["current event", "award", "appointment", "summit", "sports", "report", "scheme", "mission", "நடப்பு நிகழ்வு", "விருது", "நியமனம்", "திட்டம்"]
+  },
+  {
+    "unitId": "unit-3",
+    "subject": "Geography of India",
+    "keywords": ["geography", "river", "monsoon", "climate", "soil", "mineral", "population", "agriculture", "புவியியல்", "ஆறு", "பருவமழை", "காலநிலை", "மண்", "வேளாண்மை"]
+  },
+  {
+    "unitId": "unit-4",
+    "subject": "History and Culture of India",
+    "keywords": ["ancient india", "medieval india", "indus", "maurya", "gupta", "mughal", "culture", "architecture", "வரலாறு", "பண்பாடு", "மௌரிய", "குப்தர்"]
+  },
+  {
+    "unitId": "unit-5",
+    "subject": "Indian Polity",
+    "keywords": ["constitution", "parliament", "fundamental right", "supreme court", "president", "governor", "article", "preamble", "அரசியலமைப்பு", "நாடாளுமன்றம்", "அடிப்படை உரிமை", "உச்ச நீதிமன்றம்", "குடியரசுத் தலைவர்"]
+  },
+  {
+    "unitId": "unit-6",
+    "subject": "Indian Economy",
+    "keywords": ["economy", "gdp", "rbi", "bank", "budget", "tax", "gst", "inflation", "planning commission", "பொருளாதாரம்", "வங்கி", "வரவு செலவு", "வரி", "பணவீக்கம்"]
+  },
+  {
+    "unitId": "unit-7",
+    "subject": "Indian National Movement",
+    "keywords": ["national movement", "freedom struggle", "gandhi", "congress", "swadeshi", "independence", "தேசிய இயக்கம்", "விடுதலைப் போராட்டம்", "காந்தி", "சுதேசி"]
+  },
+  {
+    "unitId": "unit-8",
+    "subject": "Tamil Nadu History and Socio-Political Movements",
+    "keywords": ["tamil nadu history", "chola", "pandya", "pallava", "sangam", "periyar", "justice party", "தமிழ்நாடு வரலாறு", "சோழர்", "பாண்டியர்", "பல்லவர்", "சங்க காலம்", "பெரியார்"]
+  },
+  {
+    "unitId": "unit-9",
+    "subject": "Development Administration in Tamil Nadu",
+    "keywords": ["tamil nadu government", "social justice", "welfare scheme", "development administration", "reservation", "தமிழ்நாடு அரசு", "சமூக நீதி", "நலத்திட்டம்", "இடஒதுக்கீடு"]
+  },
+  {
+    "unitId": "unit-10",
+    "subject": "Aptitude and Mental Ability",
+    "keywords": ["aptitude", "ratio", "percentage", "profit", "interest", "time and work", "reasoning", "series", "திறனறிவு", "விகிதம்", "சதவீதம்", "இலாபம்", "வட்டி", "காரண அறிவு"]
+  }
+]

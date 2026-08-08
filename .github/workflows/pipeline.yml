@@ -1,0 +1,97 @@
+name: TNPSC PYQ Background Pipeline
+
+on:
+  schedule:
+    # 20:30 UTC = 02:00 IST. Processes only missing files and stops after 3.
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: Maximum number of missing papers to process
+        required: true
+        default: '3'
+      start:
+        description: Manifest index to start scanning from
+        required: true
+        default: '0'
+      force_ocr:
+        description: OCR every page instead of preferring embedded PDF text
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tnpsc-pyq-background
+  cancel-in-progress: false
+
+jobs:
+  discover-archive-extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_DATASET_REPO: ${{ secrets.HF_DATASET_REPO }}
+      PROCESS_LIMIT: ${{ inputs.limit || '3' }}
+      START_INDEX: ${{ inputs.start || '0' }}
+      FORCE_OCR: ${{ inputs.force_ocr || 'false' }}
+
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install open-source OCR tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam
+
+      - name: Install Python dependencies
+        run: pip install --requirement requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify secrets
+        run: |
+          test -n "$HF_TOKEN" || (echo "::error::HF_TOKEN is missing" && exit 1)
+          test -n "$HF_DATASET_REPO" || (echo "::error::HF_DATASET_REPO is missing" && exit 1)
+
+      - name: Refresh collision-safe official manifest
+        run: python pipeline.py discover --output data/manifest.json
+
+      - name: Validate manifest
+        run: python pipeline.py validate --manifest data/manifest.json
+
+      - name: Upload and extract next missing papers
+        run: |
+          extra_args=""
+          if [ "$FORCE_OCR" = "true" ]; then extra_args="--force-ocr"; fi
+          python pipeline.py sync --manifest data/manifest.json --limit "$PROCESS_LIMIT" --start "$START_INDEX" $extra_args
+
+      - name: Commit refreshed manifest
+        run: |
+          if git diff --quiet -- data/manifest.json; then
+            echo "Manifest unchanged."
+            exit 0
+          fi
+          git config user.name "essaar-pyq-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/manifest.json
+          git commit -m "data: refresh official TNPSC PYQ manifest"
+          git push
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### TNPSC PYQ pipeline" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Paid APIs used: **none**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Requested paper limit: **$PROCESS_LIMIT**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Hugging Face dataset: **$HF_DATASET_REPO**" >> "$GITHUB_STEP_SUMMARY"
