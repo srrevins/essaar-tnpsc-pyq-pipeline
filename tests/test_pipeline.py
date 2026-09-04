@@ -25,13 +25,14 @@ class PipelineTests(unittest.TestCase):
             "page": 3,
             "method": "embedded",
             "quality": 0.95,
-            "text": "1. Which Article protects Fundamental Rights?\n(A) Article 12\n(B) Article 32 ✓\n(C) Article 40\n(D) Article 50\n2. The RBI primarily regulates which sector?\n(A) Agriculture\n(B) Banking\n(C) Judiciary\n(D) Education\n",
+            "text": "1. Which Article protects Fundamental Rights?\n(A) Article 12\n(B) Article 32\n(C) Article 40\n(D) Article 50\n(E) Answer not known\n2. The RBI primarily regulates which sector?\n(A) Agriculture\n(B) Banking\n(C) Judiciary\n(D) Education\n(E) Answer not known\n",
         }]
         questions = pipeline.parse_questions(pages, pipeline.asdict(paper))
         self.assertEqual([item["questionNumber"] for item in questions], [1, 2])
-        self.assertEqual(questions[0]["correctOption"], "B")
         self.assertEqual(questions[0]["subject"], "Indian Polity")
         self.assertEqual(questions[1]["subject"], "Indian Economy")
+        # Answers come from the official final key, never from the paper text.
+        self.assertEqual(questions[0]["correctOption"], "")
 
     def test_all_objective_archive_rows_are_preliminary(self):
         html = """<table><tr><th>Name of the Examination</th><th>Date of Examination</th><th>Download</th></tr><tr><td>Group IV Services</td><td>01/01/2024</td><td><a href="/paper.pdf">General Studies</a></td></tr></table>"""
@@ -91,6 +92,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((root / "data" / papers[1].draftPath).exists())
             self.assertFalse((root / "data" / papers[2].draftPath).exists())
             self.assertTrue((root / "data" / papers[3].draftPath).exists())
+
     def test_github_output_is_atomic_and_skips_existing(self):
         paper = pipeline.make_paper("Group IV", 2024, "Preliminary", "objective", "General Studies", "https://example.test/paper.pdf", "https://example.test", "test")
         with tempfile.TemporaryDirectory() as temp:
@@ -118,6 +120,67 @@ class PipelineTests(unittest.TestCase):
         payload = pipeline.manifest_payload([paper, paper])
         with self.assertRaises(ValueError):
             pipeline.validate_manifest(payload)
+
+
+class OptionParsingTests(unittest.TestCase):
+    """Behaviour pinned against real Tesseract output, not synthetic text.
+
+    The fixture is page 13 of the CCSE-I 2021 Group I paper OCRed with
+    `-l eng+tam --psm 6`, the same call the pipeline makes. Its three questions
+    cover the layouts that used to break the parser: a two-across option grid,
+    a label destroyed by the examiner's highlighter, and an option whose own
+    text contains a parenthesised fragment.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        fixture = Path(__file__).resolve().parent / "fixtures" / "ccse1-2021-page013.ocr.txt"
+        paper = pipeline.make_paper("Group I", 2021, "Preliminary", "objective", "General Studies", "https://example.test/ccse1-2021.pdf", "https://example.test", "test")
+        pages = [{"page": 13, "method": "tesseract-eng+tam", "quality": 0.9, "text": fixture.read_text(encoding="utf-8")}]
+        cls.questions = pipeline.parse_questions(pages, pipeline.asdict(paper))
+        cls.by_number = {item["questionNumber"]: item for item in cls.questions}
+
+    def test_every_question_recovers_all_five_english_options(self):
+        self.assertEqual(sorted(self.by_number), [16, 17, 18])
+        for number, question in self.by_number.items():
+            with self.subTest(question=number):
+                self.assertEqual(
+                    [option["label"] for option in question["options"]],
+                    list("ABCDE"),
+                )
+
+    def test_two_across_option_grid_is_split(self):
+        # "(A) Hindi and Urdu    (B) Hindi and Sindhi" sits on one printed line.
+        options = {item["label"]: item["text"] for item in self.by_number[16]["options"]}
+        self.assertEqual(options["A"], "Hindi and Urdu")
+        self.assertEqual(options["C"], "Persian and Urdu")
+        self.assertEqual(options["D"], "Sanskrit and Hindi")
+
+    def test_parenthesised_text_stays_with_its_own_option(self):
+        # "(A) Article 16 (4)" must not be split at the "(4)".
+        options = {item["label"]: item["text"] for item in self.by_number[17]["options"]}
+        self.assertEqual(options["A"], "Article 16 (4)")
+        self.assertEqual(options["B"], "Article 17")
+
+    def test_destroyed_label_is_recovered_and_flagged(self):
+        # The highlighter sits on the correct option, so OCR returns junk for
+        # that label. The official final key gives 16 A, 17 B, 18 A.
+        self.assertEqual(self.by_number[16]["markedCandidates"], ["A"])
+        self.assertEqual(self.by_number[17]["markedCandidates"], ["B"])
+        self.assertEqual(self.by_number[18]["markedCandidates"], ["A"])
+
+    def test_bilingual_halves_are_separated(self):
+        for number, question in self.by_number.items():
+            with self.subTest(question=number):
+                self.assertEqual(question["language"], "bilingual")
+                self.assertNotIn("Answer not known", question["questionTextTa"])
+                self.assertRegex(question["questionTextTa"], r"[஀-௿]")
+                self.assertNotRegex(question["questionTextEn"], r"[஀-௿]")
+
+    def test_answers_are_not_taken_from_the_paper(self):
+        for question in self.questions:
+            self.assertEqual(question["correctOption"], "")
+            self.assertEqual(question["confidence"]["answer"], 0.0)
 
 
 if __name__ == "__main__":

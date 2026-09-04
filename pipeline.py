@@ -40,8 +40,31 @@ GS_RE = re.compile(r"\b(?:general\s+stud(?:y|ies)|g\s*\.?\s*s\.?)\b", re.I)
 PDF_RE = re.compile(r"\.pdf(?:$|[?#])", re.I)
 QUESTION_RE = re.compile(r"(?m)^\s*(\d{1,3})\s*[.)]\s+")
 TOP_QUESTION_RE = re.compile(r"(?m)^[ \t]{0,4}(\d{1,3})\s*[.)]\s+")
-OPTION_RE = re.compile(r"(?m)^\s*(?:\(([A-D])\)|([A-D])\s*[.)])\s+")
-MARK_RE = re.compile(r"[✓✔☑√]")
+# How far the next question number may be from the last accepted one. Wide
+# enough to survive a page OCR misses entirely, tight enough to reject a
+# roman-numeral list item that OCR turned into a three-digit number.
+QUESTION_NUMBER_GAP = 20
+OPTION_LETTERS = "ABCDE"
+
+# TNPSC sets options two-across whenever they are short, so a label is not
+# reliably at the start of a line. Labels also survive OCR badly: the
+# examiner's highlighter sits directly on the correct option's label, and
+# Tesseract returns junk for it ("6" for "(A)", "@" for "(B)"). Labels are
+# therefore matched by identity where they survive and recovered positionally
+# where they do not, then always renumbered A-E in reading order.
+EXACT_LABEL_RE = {
+    letter: re.compile(r"[(\[]\s*" + letter + r"\s*[)\]]", re.I)
+    for letter in OPTION_LETTERS
+}
+
+# Anything label-shaped, including what a highlighted label collapses into.
+# Only ever searched inside a gap where a specific label is known to be
+# missing, so it can afford to be permissive.
+LOOSE_LABEL_RE = re.compile(r"[(\[][^\s()\[\]]{0,3}[)\]\-]|[@©®]")
+
+# The English (E) option is fixed text on every paper and marks the end of the
+# English half of a bilingual question.
+EN_TAIL_RE = re.compile(r"answer\s*not\s*known", re.I)
 
 ARCHIVE_URLS = (
     "https://www.tnpsc.gov.in/English/question_paper_withoutkey.html",
@@ -631,10 +654,156 @@ def question_layout(question_text: str) -> dict:
         "rawLines": raw_lines,
         "structured": structured,
     }
+def split_bilingual(block: str) -> tuple[str, str]:
+    """Split a question block into its English and Tamil halves.
+
+    Every bilingual TNPSC question prints the English question with its five
+    options, then the same question in Tamil. The English (E) option is the
+    fixed string "Answer not known", so the Tamil half begins on the line after
+    it. Returns (english, tamil); tamil is "" on a monolingual paper.
+    """
+    match = EN_TAIL_RE.search(block)
+    if not match:
+        return block.strip(), ""
+    line_end = block.find("\n", match.end())
+    if line_end == -1:
+        return block.strip(), ""
+    return block[:line_end].strip(), block[line_end + 1:].strip()
+
+
+def _missing_runs(anchors: dict[str, tuple[int, int]]) -> list[list[str]]:
+    """Group letters with no surviving label into consecutive runs."""
+    runs: list[list[str]] = []
+    for letter in OPTION_LETTERS:
+        if letter in anchors:
+            continue
+        if runs and OPTION_LETTERS.index(runs[-1][-1]) == OPTION_LETTERS.index(letter) - 1:
+            runs[-1].append(letter)
+        else:
+            runs.append([letter])
+    return runs
+
+
+def _clean_option_text(raw: str, drop_leading_token: bool) -> str:
+    text = " ".join(raw.split())
+    if drop_leading_token:
+        # The label was destroyed rather than merely misread, so whatever OCR
+        # left in its place is the first token. Only ever drop a very short
+        # one, so real content like "16 (4) சரத்து" survives intact.
+        head, _, tail = text.partition(" ")
+        if len(head) <= 2:
+            text = tail
+    return text.strip(" .:;,~*_-–—")
+
+
+def parse_options(region: str) -> tuple[list[dict], set[str], float]:
+    """Split an option region into options A-E in reading order.
+
+    Returns the options, the letters whose printed label OCR lost, and a
+    structural confidence. Letters are assigned by position, never by the
+    character OCR read, because the labels are the least reliable glyphs on
+    the page and their order is guaranteed.
+    """
+    anchors: dict[str, tuple[int, int]] = {}
+    cursor = 0
+    for letter in OPTION_LETTERS:
+        match = EXACT_LABEL_RE[letter].search(region, cursor)
+        if match:
+            anchors[letter] = match.span()
+            cursor = match.end()
+
+    if not anchors:
+        return [], set(), 0.0
+
+    recovered: set[str] = set()
+    lost: set[str] = set()
+    # Missing labels are resolved a run at a time, because consecutive missing
+    # letters share one gap and have to be split between them.
+    for run in _missing_runs(anchors):
+        first, last = OPTION_LETTERS.index(run[0]), OPTION_LETTERS.index(run[-1])
+        start = 0
+        for previous in reversed(OPTION_LETTERS[:first]):
+            if previous in anchors:
+                start = anchors[previous][1]
+                break
+        end = len(region)
+        for following in OPTION_LETTERS[last + 1:]:
+            if following in anchors:
+                end = anchors[following][0]
+                break
+        if start >= end or not region[start:end].strip():
+            continue
+        # Take the *last* candidates in the gap. Parenthesised fragments of an
+        # option's own text ("Article 16 (4)") sort before the label that
+        # follows them, so preferring later candidates keeps such text with the
+        # option it belongs to.
+        candidates = [m.span() for m in LOOSE_LABEL_RE.finditer(region, start, end)]
+        chosen = candidates[-len(run):] if candidates else []
+        offset = len(run) - len(chosen)
+        for position, letter in enumerate(run):
+            if position < offset:
+                # No label survived for this one; its text simply starts here.
+                anchors[letter] = (start, start)
+                lost.add(letter)
+            else:
+                anchors[letter] = chosen[position - offset]
+            recovered.add(letter)
+
+    options: list[dict] = []
+    for index, letter in enumerate(OPTION_LETTERS):
+        if letter not in anchors:
+            continue
+        start = anchors[letter][1]
+        end = len(region)
+        for following in OPTION_LETTERS[index + 1:]:
+            if following in anchors:
+                end = anchors[following][0]
+                break
+        text = _clean_option_text(region[start:end], letter in lost)
+        if not text:
+            continue
+        options.append({"label": letter, "text": text})
+
+    if len(options) < len(OPTION_LETTERS):
+        confidence = 0.35
+    elif recovered:
+        confidence = 0.75
+    else:
+        confidence = 1.0
+    return options, recovered, confidence
+
+
+def _options_start(half: str) -> int:
+    positions = [
+        match.start()
+        for match in (EXACT_LABEL_RE[letter].search(half) for letter in OPTION_LETTERS)
+        if match
+    ]
+    if not positions:
+        return len(half)
+    # A destroyed label can precede the first surviving one on the same printed
+    # line, so the stem ends where that line begins rather than at the label.
+    return half.rfind("\n", 0, min(positions)) + 1
+
+
+def parse_half(half: str) -> tuple[str, list[dict], set[str], float]:
+    """Split one language half into its question stem and its options."""
+    if not half.strip():
+        return "", [], set(), 0.0
+    boundary = _options_start(half)
+    stem = half[:boundary].strip()
+    options, recovered, score = parse_options(half[boundary:])
+    return stem, options, recovered, score
+
+
 def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
     tags = load_tags()
     questions: list[dict] = []
     seen_numbers: set[int] = set()
+    # Question numbers run 1..N in order, so anything that jumps is not one.
+    # Roman numerals inside a statement list are the usual culprit: OCR reads
+    # "III." as "111." and it looks exactly like a question number.
+    last_number = 0
     for page in pages:
         text = page["text"]
         matches = list(TOP_QUESTION_RE.finditer(text)) or list(QUESTION_RE.finditer(text))
@@ -642,27 +811,31 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
             number = int(match.group(1))
             if number < 1 or number > 250 or number in seen_numbers:
                 continue
+            if last_number and not (last_number < number <= last_number + QUESTION_NUMBER_GAP):
+                continue
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
             block = text[match.end():end].strip()
             if len(block) < 15:
                 continue
-            option_matches = list(OPTION_RE.finditer(block))
-            question_text = block[: option_matches[0].start()].strip() if option_matches else block
-            options = []
-            marked = ""
-            for option_index, option_match in enumerate(option_matches[:4]):
-                option_end = option_matches[option_index + 1].start() if option_index + 1 < len(option_matches) else len(block)
-                label = option_match.group(1) or option_match.group(2) or ""
-                value = block[option_match.end():option_end].strip()
-                canonical = chr(ord("A") + int(label) - 1) if label.isdigit() else label.upper()
-                if MARK_RE.search(value) or MARK_RE.search(option_match.group(0)):
-                    marked = canonical
-                options.append({"label": canonical, "text": MARK_RE.sub("", value).strip()})
+            english_half, tamil_half = split_bilingual(block)
+            english_stem, english_options, english_marks, english_score = parse_half(english_half)
+            tamil_stem, tamil_options, _, tamil_score = parse_half(tamil_half)
+
+            # The English half carries the printed options students are scored
+            # on; the Tamil half is the same question and is kept alongside it.
+            options = english_options or tamil_options
+            question_text = english_stem or tamil_stem
             layout = question_layout(question_text)
-            language = detect_language(question_text)
-            tag = tag_question(f"{question_text} {' '.join(item['text'] for item in options)}", tags)
-            structure_confidence = 0.92 if len(options) == 4 else 0.55 if options else 0.3
+            language = (
+                "bilingual" if english_stem and tamil_stem
+                else detect_language(question_text)
+            )
+            tag = tag_question(f"{english_stem} {' '.join(item['text'] for item in english_options)}", tags)
+            structure_confidence = round(
+                english_score if not tamil_half else (english_score + tamil_score) / 2, 2
+            )
             seen_numbers.add(number)
+            last_number = number
             questions.append(
                 {
                     "id": f"{paper['id']}-q{number:03d}",
@@ -671,12 +844,18 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
                     "page": page["page"],
                     "language": language,
                     "questionTextRaw": question_text,
-                    "questionTextEn": question_text if language in {"en", "bilingual"} else "",
-                    "questionTextTa": question_text if language in {"ta", "bilingual"} else "",
+                    "questionTextEn": english_stem,
+                    "questionTextTa": tamil_stem,
                     "questionType": layout["type"],
                     "layout": layout,
                     "options": options,
-                    "correctOption": marked,
+                    "optionsTa": tamil_options,
+                    # Answers come from the official final answer key, joined in
+                    # a later step. A destroyed option label is a hint that the
+                    # examiner's mark sat there, recorded here only so the join
+                    # can be cross-checked against it.
+                    "correctOption": "",
+                    "markedCandidates": sorted(english_marks),
                     "subject": tag["subject"],
                     "unitId": tag["unitId"],
                     "subtopic": tag["subtopic"],
@@ -685,7 +864,7 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
                     "confidence": {
                         "text": page["quality"],
                         "structure": structure_confidence,
-                        "answer": 0.9 if marked else 0.0,
+                        "answer": 0.0,
                         "tagging": tag["confidence"],
                     },
                     "reviewStatus": "needs_review",
