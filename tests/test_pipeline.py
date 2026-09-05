@@ -373,3 +373,43 @@ class SyllabusTaggerTests(unittest.TestCase):
                 tags = pipeline.load_tags()
         self.assertEqual(tags[0]["subtopic"], "")
         self.assertEqual(tags[0]["unitId"], "unit-1")
+
+
+class DestroyedLabelTests(unittest.TestCase):
+    """Options set one per line, where the highlighter destroyed a label.
+
+    Verbatim Tesseract output for question 10 of the CCSE-I 2021 paper. The
+    examiner's mark sat on (D) and OCR returned "Qs" for it, leaving nothing
+    bracket-shaped to find. The line break is the boundary.
+    """
+
+    REGION = (
+        "_ (A) _ Dr. Muthulakshmi Reddy\n"
+        "(B) TM. Nair\n"
+        "(C) Thanthai Periyar\n"
+        "Qs Ramalinga Adigal\n"
+        "(E) Answer not known\n"
+    )
+
+    def test_a_line_break_separates_options_when_no_label_survives(self):
+        options, recovered, _ = pipeline.parse_options(self.REGION)
+        self.assertEqual([item["label"] for item in options], list("ABCDE"))
+        texts = {item["label"]: item["text"] for item in options}
+        # Without the line boundary, C came back empty and D swallowed both.
+        self.assertEqual(texts["C"], "Thanthai Periyar")
+        self.assertEqual(texts["D"], "Ramalinga Adigal")
+        self.assertIn("D", recovered)
+
+    def test_the_junk_left_by_the_mark_is_trimmed(self):
+        options, _, _ = pipeline.parse_options(self.REGION)
+        for item in options:
+            self.assertNotIn("Qs", item["text"])
+
+    def test_a_gap_with_no_line_break_still_falls_back(self):
+        # Two-across grid: (A) destroyed, and (B) on the same printed line, so
+        # there is no line break to split on and the leading junk is dropped.
+        options, _, _ = pipeline.parse_options(
+            "6 Hindi and Urdu (B) Hindi and Sindhi\n(C) Persian\n(D) Sanskrit\n(E) Answer not known\n")
+        texts = {item["label"]: item["text"] for item in options}
+        self.assertEqual(texts["A"], "Hindi and Urdu")
+        self.assertEqual(texts["B"], "Hindi and Sindhi")
