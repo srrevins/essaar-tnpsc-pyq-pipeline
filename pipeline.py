@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -65,6 +66,19 @@ LOOSE_LABEL_RE = re.compile(r"[(\[][^\s()\[\]]{0,3}[)\]\-]|[@©®]")
 # The English (E) option is fixed text on every paper and marks the end of the
 # English half of a bilingual question.
 EN_TAIL_RE = re.compile(r"answer\s*not\s*known", re.I)
+
+# TNPSC publishes a separate one-page final answer key: a typed grid of five
+# (S.No, Key) column pairs. A cell holds one letter, several separated by
+# slashes when more than one answer was accepted, or "ALL" when the question
+# was withdrawn and every candidate awarded the mark.
+ANSWER_CELL_RE = re.compile(r"\bALL\b|[A-E](?:/[A-E])+|[A-E]", re.I)
+QB_CODE_RE = re.compile(r"QB\s*Code\s*[:.]?\s*([A-Z0-9]+(?:/[A-Z0-9]+)*)", re.I)
+KEY_VERSION_RE = re.compile(r"VERSION\s*KEY\s*[-\u2013]?\s*([A-D])\b", re.I)
+SUBJECT_CODE_RE = re.compile(r"Subject\s*Code\s*[:.]?\s*(\d{3})", re.I)
+
+# The same code is printed in the question paper's page footer ("GR1P/21"),
+# which is what lets a key be matched to the booklet version it describes.
+PAPER_QB_CODE_RE = re.compile(r"\b([A-Z]{2,6}\d{0,2}[A-Z]?/\d{2})\b")
 
 ARCHIVE_URLS = (
     "https://www.tnpsc.gov.in/English/question_paper_withoutkey.html",
@@ -774,16 +788,37 @@ def parse_options(region: str) -> tuple[list[dict], set[str], float]:
 
 
 def _options_start(half: str) -> int:
-    positions = [
-        match.start()
-        for match in (EXACT_LABEL_RE[letter].search(half) for letter in OPTION_LETTERS)
-        if match
-    ]
-    if not positions:
+    found = {}
+    for letter in OPTION_LETTERS:
+        match = EXACT_LABEL_RE[letter].search(half)
+        if match:
+            found[letter] = match.start()
+    if not found:
         return len(half)
-    # A destroyed label can precede the first surviving one on the same printed
-    # line, so the stem ends where that line begins rather than at the label.
-    return half.rfind("\n", 0, min(positions)) + 1
+
+    first = min(found, key=found.get)
+    start = found[first]
+    line_start = half.rfind("\n", 0, start) + 1
+
+    # Only (A) is worth recovering this way. The highlighter destroys exactly
+    # one label per question, so a single missing leading label is the mark;
+    # several missing means OCR failed broadly on this half and stepping back
+    # would swallow the question text itself.
+    if OPTION_LETTERS.index(first) != 1:
+        return line_start
+
+    if half[line_start:start].strip():
+        # (A) shares the printed line with (B) in the two-across grid, so
+        # ending the stem at the line start already captures it.
+        return line_start
+
+    # (B) opens its own line, so (A) was set on the line above and its text
+    # would otherwise be read as part of the question.
+    if line_start:
+        previous = half.rfind("\n", 0, line_start - 1) + 1
+        if previous < line_start:
+            line_start = previous
+    return line_start
 
 
 def parse_half(half: str) -> tuple[str, list[dict], set[str], float]:
@@ -871,6 +906,188 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
                 }
             )
     return sorted(questions, key=lambda item: item["questionNumber"])
+
+
+def parse_answer_key(text: str, total: int = 200, columns: int = 5) -> tuple[dict[int, list[str]], list[int]]:
+    """Read TNPSC's one-page final answer key into {question: accepted options}.
+
+    The key is a fixed grid of five (S.No, Key) column pairs, so row R carries
+    questions R, R+40, R+80, R+120 and R+160. Serial numbers are used as
+    anchors and the answer read from the gap after each, which keeps a cell
+    readable even when the clerk's verification tick lands on top of it.
+
+    Returns the answers and the questions whose cell could not be read. An
+    unreadable cell is reported rather than guessed, so the caller can refuse
+    the key instead of publishing an invented answer.
+    """
+    rows = total // columns
+    lines = text.splitlines()
+    answers: dict[int, list[str]] = {}
+    unreadable: list[int] = []
+
+    for row in range(1, rows + 1):
+        serials = [row + column * rows for column in range(columns)]
+        # The row's line is whichever carries the most of its expected serials.
+        line, best = None, 0
+        for candidate in lines:
+            numbers = set(re.findall(r"\d+", candidate))
+            hits = sum(1 for serial in serials if str(serial) in numbers)
+            if hits > best:
+                line, best = candidate, hits
+        if line is None or best < 3:
+            unreadable.extend(serials)
+            continue
+
+        ends: dict[int, int] = {}
+        cursor = 0
+        for serial in serials:
+            match = re.compile(r"(?<!\d)" + str(serial) + r"(?!\d)").search(line, cursor)
+            if match:
+                ends[serial] = match.end()
+                cursor = match.end()
+
+        for index, serial in enumerate(serials):
+            if serial not in ends:
+                unreadable.append(serial)
+                continue
+            stop = len(line)
+            for following in serials[index + 1:]:
+                if following in ends:
+                    stop = line.rfind(str(following), ends[serial], ends[following])
+                    break
+            gap = line[ends[serial]:stop if stop > ends[serial] else len(line)]
+            match = ANSWER_CELL_RE.search(gap)
+            if not match:
+                unreadable.append(serial)
+                continue
+            value = match.group().upper()
+            answers[serial] = list(OPTION_LETTERS) if value == "ALL" else value.split("/")
+
+    return answers, sorted(set(unreadable))
+
+
+def merge_answer_keys(passes: Iterable[dict[int, list[str]]]) -> tuple[dict[int, list[str]], list[int]]:
+    """Combine several OCR passes over the same key by majority vote.
+
+    Rendering the key at different scales, and with the character set
+    constrained or not, makes different mistakes: a cell one pass cannot read
+    another usually can. Pass them most-trusted first. A cell only two passes
+    read, differently, has no majority; the more trusted reading is kept and
+    the question is reported as contested so review can settle it, because
+    dropping it would lose an answer that is probably right.
+    """
+    ordered = list(passes)
+    votes: dict[int, Counter] = defaultdict(Counter)
+    first_seen: dict[int, str] = {}
+    for result in ordered:
+        for question, options in result.items():
+            value = "/".join(options)
+            votes[question][value] += 1
+            first_seen.setdefault(question, value)
+
+    merged: dict[int, list[str]] = {}
+    contested: list[int] = []
+    for question, tally in votes.items():
+        ranked = tally.most_common()
+        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+            contested.append(question)
+            merged[question] = first_seen[question].split("/")
+        else:
+            merged[question] = ranked[0][0].split("/")
+    return merged, sorted(contested)
+
+
+def normalise_qb_code(value: str) -> str:
+    """Strip the punctuation and case OCR varies on, so "GR1P/21" compares."""
+    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def answer_key_metadata(text: str) -> dict:
+    """Pull the identifiers that decide whether a key belongs to a paper."""
+    qb_code = QB_CODE_RE.search(text)
+    version = KEY_VERSION_RE.search(text)
+    subject = SUBJECT_CODE_RE.search(text)
+    return {
+        "qbCode": normalise_qb_code(qb_code.group(1)) if qb_code else "",
+        "versionKey": version.group(1).upper() if version else "",
+        "subjectCode": subject.group(1) if subject else "",
+    }
+
+
+def paper_qb_code(pages: list[dict]) -> str:
+    """Recover the QB code TNPSC prints in the question paper's page footer.
+
+    Taken as the most frequent match across pages, so a single badly OCRed
+    footer cannot decide which key a paper is joined to.
+    """
+    counts: Counter = Counter()
+    for page in pages:
+        for match in PAPER_QB_CODE_RE.finditer(page.get("text", "")):
+            counts[normalise_qb_code(match.group(1))] += 1
+    if not counts:
+        return ""
+    code, seen = counts.most_common(1)[0]
+    return code if seen >= 2 else ""
+
+
+def join_answer_key(questions: list[dict], answers: dict[int, list[str]], key_meta: dict, paper_code: str) -> dict:
+    """Attach official answers to questions, but only for the right paper.
+
+    TNPSC issues booklets in several versions carrying the same questions in a
+    different order, so a key from the wrong version would produce two hundred
+    plausible and entirely wrong answers. The QB code printed on both documents
+    is the only thing that rules that out, so a paper whose code cannot be read
+    or does not match is left with no answers at all.
+    """
+    key_code = key_meta.get("qbCode", "")
+    if not key_code or not paper_code or key_code != paper_code:
+        return {
+            "joined": False,
+            "reason": "qb_code_mismatch" if key_code and paper_code else "qb_code_unreadable",
+            "paperQbCode": paper_code,
+            "keyQbCode": key_code,
+            "answered": 0,
+            "corroborated": 0,
+            "contradicted": [],
+        }
+
+    corroborated, contradicted, answered = 0, [], 0
+    for question in questions:
+        accepted = answers.get(question["questionNumber"])
+        if not accepted:
+            continue
+        answered += 1
+        question["acceptedOptions"] = accepted
+        question["allCorrect"] = len(accepted) == len(OPTION_LETTERS)
+        question["correctOption"] = accepted[0] if len(accepted) == 1 else ""
+        question["answerSource"] = "tnpsc_final_answer_key"
+        question["answerKeyVersion"] = key_meta.get("versionKey", "")
+
+        # The examiner's highlighter destroys the label it covers, so the
+        # positional recovery done while parsing options is an independent read
+        # of the same fact. Where both exist and agree, two unrelated
+        # mechanisms have produced the same answer.
+        hints = question.get("markedCandidates") or []
+        if len(hints) == 1:
+            if hints[0] in accepted:
+                corroborated += 1
+                question["confidence"]["answer"] = 1.0
+            else:
+                contradicted.append(question["questionNumber"])
+                question["confidence"]["answer"] = 0.5
+        else:
+            question["confidence"]["answer"] = 0.9
+
+    return {
+        "joined": True,
+        "reason": "",
+        "paperQbCode": paper_code,
+        "keyQbCode": key_code,
+        "versionKey": key_meta.get("versionKey", ""),
+        "answered": answered,
+        "corroborated": corroborated,
+        "contradicted": contradicted,
+    }
 
 
 def extract_draft(pdf_path: Path, paper: dict, sha256: str, force_ocr: bool = False) -> dict:

@@ -185,3 +185,134 @@ class OptionParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AnswerKeyTests(unittest.TestCase):
+    """Pinned against real OCR of the official CCSE-I 2021 final answer key.
+
+    Two fixtures, because the key needs two passes: a character whitelist
+    reads the table cleanly but destroys the header, and an unconstrained pass
+    reads the header. Both are Tesseract output, not idealised text.
+    """
+
+    FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.table = (cls.FIXTURES / "ccse1-2021-final-key.whitelist.ocr.txt").read_text(encoding="utf-8")
+        cls.plain = (cls.FIXTURES / "ccse1-2021-final-key.plain.ocr.txt").read_text(encoding="utf-8")
+        cls.answers, cls.unreadable = pipeline.parse_answer_key(cls.table)
+        cls.meta = pipeline.answer_key_metadata(cls.plain)
+
+    def test_reads_most_of_the_grid(self):
+        self.assertGreaterEqual(len(self.answers), 175)
+        self.assertEqual(len(self.answers) + len(self.unreadable), 200)
+
+    def test_reads_cells_from_every_column(self):
+        # Row 1 spans all five columns: questions 1, 41, 81, 121 and 161.
+        self.assertEqual(self.answers[1], ["D"])
+        self.assertEqual(self.answers[41], ["A"])
+        self.assertEqual(self.answers[81], ["B"])
+        self.assertEqual(self.answers[121], ["B"])
+        self.assertEqual(self.answers[161], ["A"])
+        self.assertEqual(self.answers[200], ["B"])
+
+    def test_disputed_questions_keep_every_accepted_option(self):
+        self.assertEqual(self.answers[16], ["A", "D"])
+        self.assertEqual(self.answers[47], ["A", "D"])
+        self.assertEqual(self.answers[56], ["A", "B", "C"])
+        self.assertEqual(self.answers[64], ["A", "B", "C", "D"])
+
+    def test_withdrawn_questions_accept_all_options(self):
+        # "ALL" means the question was withdrawn and every candidate marked.
+        self.assertEqual(self.answers[48], list("ABCDE"))
+
+    def test_unreadable_cells_are_reported_not_guessed(self):
+        for question in self.unreadable:
+            self.assertNotIn(question, self.answers)
+
+    def test_metadata_identifies_the_paper(self):
+        self.assertEqual(self.meta["qbCode"], "GR1P21")
+        self.assertEqual(self.meta["versionKey"], "D")
+        self.assertEqual(self.meta["subjectCode"], "003")
+
+    def test_paper_code_comes_from_repeated_footers(self):
+        pages = [{"text": "some question text\nGR1P/21 7 va)"} for _ in range(4)]
+        self.assertEqual(pipeline.paper_qb_code(pages), "GR1P21")
+        # A code seen only once is not enough to decide which key to trust.
+        self.assertEqual(pipeline.paper_qb_code(pages[:1]), "")
+        self.assertEqual(pipeline.paper_qb_code([{"text": "no code here"}]), "")
+
+    def test_merge_prefers_the_majority_and_flags_a_split(self):
+        merged, contested = pipeline.merge_answer_keys([
+            {1: ["A"], 2: ["B"]},
+            {1: ["A"], 2: ["C"]},
+            {1: ["D"]},
+        ])
+        self.assertEqual(merged[1], ["A"])
+        self.assertNotIn(1, contested)
+        # Two passes, two readings: the more trusted one is kept but flagged.
+        self.assertEqual(merged[2], ["B"])
+        self.assertIn(2, contested)
+
+
+class AnswerKeyJoinTests(unittest.TestCase):
+    """The join must refuse any key it cannot prove belongs to the paper."""
+
+    def build(self, marked=None):
+        return [{
+            "questionNumber": 1,
+            "markedCandidates": marked if marked is not None else [],
+            "confidence": {"text": 0.9, "structure": 1.0, "answer": 0.0, "tagging": 0.5},
+        }]
+
+    def test_refuses_a_key_from_another_booklet_version(self):
+        questions = self.build()
+        report = pipeline.join_answer_key(questions, {1: ["A"]}, {"qbCode": "GR1P21"}, "CCS1P22")
+        self.assertFalse(report["joined"])
+        self.assertEqual(report["reason"], "qb_code_mismatch")
+        self.assertNotIn("acceptedOptions", questions[0])
+
+    def test_refuses_when_either_code_is_unreadable(self):
+        for key_code, paper_code in (("", "GR1P21"), ("GR1P21", "")):
+            with self.subTest(key=key_code, paper=paper_code):
+                questions = self.build()
+                report = pipeline.join_answer_key(questions, {1: ["A"]}, {"qbCode": key_code}, paper_code)
+                self.assertFalse(report["joined"])
+                self.assertEqual(report["reason"], "qb_code_unreadable")
+                self.assertNotIn("acceptedOptions", questions[0])
+
+    def test_applies_the_key_when_the_codes_agree(self):
+        questions = self.build()
+        report = pipeline.join_answer_key(questions, {1: ["C"]}, {"qbCode": "GR1P21", "versionKey": "D"}, "GR1P21")
+        self.assertTrue(report["joined"])
+        self.assertEqual(questions[0]["correctOption"], "C")
+        self.assertEqual(questions[0]["acceptedOptions"], ["C"])
+        self.assertFalse(questions[0]["allCorrect"])
+        self.assertEqual(questions[0]["answerSource"], "tnpsc_final_answer_key")
+        self.assertEqual(questions[0]["answerKeyVersion"], "D")
+
+    def test_a_disputed_question_has_no_single_correct_option(self):
+        questions = self.build()
+        pipeline.join_answer_key(questions, {1: ["A", "D"]}, {"qbCode": "X"}, "X")
+        self.assertEqual(questions[0]["acceptedOptions"], ["A", "D"])
+        self.assertEqual(questions[0]["correctOption"], "")
+        self.assertFalse(questions[0]["allCorrect"])
+
+    def test_a_withdrawn_question_is_marked_all_correct(self):
+        questions = self.build()
+        pipeline.join_answer_key(questions, {1: list("ABCDE")}, {"qbCode": "X"}, "X")
+        self.assertTrue(questions[0]["allCorrect"])
+        self.assertEqual(questions[0]["correctOption"], "")
+
+    def test_the_highlighter_hint_corroborates_or_contradicts_the_key(self):
+        agreeing = self.build(marked=["C"])
+        report = pipeline.join_answer_key(agreeing, {1: ["C"]}, {"qbCode": "X"}, "X")
+        self.assertEqual(report["corroborated"], 1)
+        self.assertEqual(agreeing[0]["confidence"]["answer"], 1.0)
+
+        conflicting = self.build(marked=["A"])
+        report = pipeline.join_answer_key(conflicting, {1: ["C"]}, {"qbCode": "X"}, "X")
+        self.assertEqual(report["contradicted"], [1])
+        # The key is authoritative; the hint only lowers confidence for review.
+        self.assertEqual(conflicting[0]["correctOption"], "C")
+        self.assertEqual(conflicting[0]["confidence"]["answer"], 0.5)
