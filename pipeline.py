@@ -17,6 +17,7 @@ import time
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Iterator
 from urllib.parse import urljoin, urlparse
@@ -570,21 +571,86 @@ def extract_pages(pdf_path: Path, force_ocr: bool = False) -> tuple[list[dict], 
 
 
 def load_tags() -> list[dict]:
-    return json.loads(TAG_CONFIG.read_text(encoding="utf-8"))
+    """Load the syllabus taxonomy, flattened to one entry per subtopic.
+
+    Schema 2 carries the official unit/subtopic tree with keywords on each
+    subtopic. The older flat list is still accepted so an old config keeps
+    working, it simply cannot produce a subtopic.
+    """
+    raw = json.loads(TAG_CONFIG.read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        return [dict(entry, subtopic="") for entry in raw]
+
+    flattened: list[dict] = []
+    for unit in raw.get("units", []):
+        for subtopic in unit.get("subtopics", []):
+            flattened.append({
+                "unitId": unit["unitId"],
+                "subject": unit["subject"],
+                "subtopic": subtopic["name"],
+                "keywords": subtopic.get("keywords", []),
+            })
+    return flattened
+
+
+UNMAPPED_TAG = {
+    "unitId": "unmapped",
+    "subject": "Unmapped subject",
+    "subtopic": "Unmapped subtopic",
+    "matchedKeywords": [],
+    "confidence": 0.0,
+}
+
+# Below this a match is one incidental word and says nothing about the topic.
+TAG_CONFIDENCE_FLOOR = 0.45
+
+
+def _keyword_matcher(keyword: str) -> re.Pattern:
+    return re.compile(r"(?<!\w)" + re.escape(keyword.casefold()) + r"(?!\w)")
+
+
+@lru_cache(maxsize=4096)
+def _keyword_hit(keyword: str, text: str) -> bool:
+    return bool(_keyword_matcher(keyword).search(text))
 
 
 def tag_question(text: str, tags: list[dict]) -> dict:
+    """Map a question to its syllabus unit and subtopic.
+
+    Matching is on whole words: substring matching let "art" pull any question
+    mentioning a part, a chart or the Charter into History. Scoring prefers the
+    subtopic with the most distinct hits, then the longest, since a long
+    keyword ("fundamental rights") is far more diagnostic than a short one.
+    Pass the English text only — mixing both languages of a bilingual question
+    dilutes the score without adding signal.
+    """
     normalized = unicodedata.normalize("NFKC", text).casefold()
+    if not normalized.strip():
+        return dict(UNMAPPED_TAG)
+
     scored = []
     for entry in tags:
-        hits = [keyword for keyword in entry["keywords"] if keyword.casefold() in normalized]
+        hits = [word for word in entry["keywords"] if _keyword_hit(word, normalized)]
         if hits:
-            scored.append((len(hits), max(map(len, hits)), entry, hits))
+            scored.append((len(hits), max(len(word) for word in hits), entry, hits))
     if not scored:
-        return {"unitId": "unmapped", "subject": "Unmapped subject", "subtopic": "Unmapped subtopic", "matchedKeywords": [], "confidence": 0.0}
+        return dict(UNMAPPED_TAG)
+
     _, _, entry, hits = max(scored, key=lambda item: (item[0], item[1]))
-    confidence = min(0.95, 0.45 + 0.12 * len(hits))
-    return {"unitId": entry["unitId"], "subject": entry["subject"], "subtopic": "Unmapped subtopic", "matchedKeywords": hits[:8], "confidence": round(confidence, 2)}
+    longest = max(len(word) for word in hits)
+    confidence = min(0.95, 0.3 + 0.15 * len(hits) + (0.15 if longest >= 10 else 0.0))
+    if confidence < TAG_CONFIDENCE_FLOOR:
+        # Say nothing rather than guess: an unmapped question is a known gap,
+        # a wrongly mapped one silently corrupts the coverage figures.
+        return dict(UNMAPPED_TAG, matchedKeywords=sorted(hits)[:8])
+
+    return {
+        "unitId": entry["unitId"],
+        "subject": entry["subject"],
+        "subtopic": entry.get("subtopic") or "Unmapped subtopic",
+        "matchedKeywords": sorted(hits, key=len, reverse=True)[:8],
+        "confidence": round(confidence, 2),
+    }
 
 
 def detect_language(text: str) -> str:
