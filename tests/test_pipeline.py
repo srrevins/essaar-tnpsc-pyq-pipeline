@@ -462,3 +462,76 @@ class QuestionIssueTests(unittest.TestCase):
                   "1. Which Article protects Fundamental Rights?\n(A) Article 12\n(B) Article 32\n(C) Article 40\n(D) Article 50\n(E) Answer not known\n"}]
         questions = pipeline.parse_questions(pages, pipeline.asdict(paper))
         self.assertEqual(questions[0]["issues"], [])
+
+
+class ScorecardTests(unittest.TestCase):
+    """The report that decides which papers may be promoted."""
+
+    def draft(self, paper_id, issues_per_question):
+        return {
+            "schemaVersion": 2,
+            "paper": {"id": paper_id, "year": 2021, "examGroup": "Group I"},
+            "questions": [
+                {"questionNumber": index + 1, "issues": issues,
+                 "subtopic": "Fundamental Rights",
+                 "acceptedOptions": ["A"] if not issues else []}
+                for index, issues in enumerate(issues_per_question)
+            ],
+        }
+
+    def test_counts_complete_questions_not_questions_found(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "2021").mkdir()
+            write = lambda name, draft: (root / "2021" / name).write_text(json.dumps(draft), encoding="utf-8")
+            write("good.json", self.draft("good", [[], [], []]))
+            write("poor.json", self.draft("poor", [[], ["incomplete_options"], ["no_options_found"]]))
+            report = pipeline.build_scorecard(root)
+
+        self.assertEqual(report["totals"]["papers"], 2)
+        self.assertEqual(report["totals"]["questions"], 6)
+        self.assertEqual(report["totals"]["clean"], 4)
+        self.assertEqual(report["cleanRate"], round(4 / 6, 3))
+        self.assertEqual(report["issueCounts"],
+                         {"incomplete_options": 1, "no_options_found": 1})
+        # Best papers first, so review time goes where it pays.
+        self.assertEqual([item["id"] for item in report["papers"]], ["good", "poor"])
+
+    def test_a_gzipped_draft_reads_the_same(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = json.dumps(self.draft("zipped", [[], []])).encode("utf-8")
+            (root / "zipped.json.gz").write_bytes(gzip.compress(payload))
+            report = pipeline.build_scorecard(root)
+        self.assertEqual(report["totals"]["clean"], 2)
+
+    def test_an_unreadable_draft_is_reported_not_fatal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "broken.json").write_text("{not json", encoding="utf-8")
+            report = pipeline.build_scorecard(root)
+        self.assertEqual(report["totals"].get("papers", 0), 0)
+        self.assertEqual(report["papers"][0]["error"], "unreadable")
+
+
+class OcrRobustnessTests(unittest.TestCase):
+    def _page(self):
+        page = mock.MagicMock()
+        page.number = 6
+        page.get_pixmap.return_value = mock.MagicMock()
+        return page
+
+    def test_tesseract_is_pinned_to_one_thread(self):
+        # Tesseract takes every core it can find, so parallel extraction
+        # oversubscribes the machine and pages start exceeding the timeout.
+        with mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/tesseract"), \
+             mock.patch.object(pipeline.subprocess, "run") as run:
+            run.return_value = mock.MagicMock(returncode=0, stdout="text")
+            pipeline.ocr_page(self._page(), Path(tempfile.gettempdir()))
+        self.assertEqual(run.call_args.kwargs["env"]["OMP_THREAD_LIMIT"], "1")
+
+    def test_one_slow_page_does_not_lose_the_paper(self):
+        with mock.patch.object(pipeline.shutil, "which", return_value="/usr/bin/tesseract"), \
+             mock.patch.object(pipeline.subprocess, "run",
+                               side_effect=pipeline.subprocess.TimeoutExpired("tesseract", 180)):
+            self.assertEqual(pipeline.ocr_page(self._page(), Path(tempfile.gettempdir())), "")
