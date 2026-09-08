@@ -992,7 +992,42 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
                     "reviewStatus": "needs_review",
                 }
             )
+    for question in questions:
+        question["issues"] = question_issues(question)
     return sorted(questions, key=lambda item: item["questionNumber"])
+
+
+def question_issues(question: dict) -> list[str]:
+    """Name what is wrong with a parsed question, for the review queue.
+
+    A question that failed to parse is worth more as a labelled gap than as a
+    plausible-looking wrong record. These are the checks that can be made
+    without the source PDF, so they run on every question and cost nothing.
+    """
+    issues: list[str] = []
+    count = len(question.get("options") or [])
+    if count == 0:
+        issues.append("no_options_found")
+    elif count < len(OPTION_LETTERS):
+        issues.append("incomplete_options")
+
+    # Match-the-following and statement questions print their own lettered
+    # list above the options, and OCR flattens it into something the parser
+    # cannot tell from the options themselves. When one of those also comes
+    # out short, the option block was probably never found at all.
+    if question.get("questionType") != "standard" and count < len(OPTION_LETTERS):
+        issues.append("structured_layout_unresolved")
+
+    english = (question.get("questionTextEn") or "").strip()
+    tamil = (question.get("questionTextTa") or "").strip()
+    if not english and not tamil:
+        issues.append("no_question_text")
+    elif not english:
+        issues.append("no_english_text")
+    elif len(english) < 25:
+        issues.append("question_text_truncated")
+
+    return issues
 
 
 def parse_answer_key(text: str, total: int = 200, columns: int = 5) -> tuple[dict[int, list[str]], list[int]]:
@@ -1188,6 +1223,10 @@ def extract_draft(pdf_path: Path, paper: dict, sha256: str, force_ocr: bool = Fa
             **audit,
             "questionCount": len(questions),
             "answerCount": sum(bool(item["correctOption"]) for item in questions),
+            "completeQuestionCount": sum(not item["issues"] for item in questions),
+            "issueCounts": dict(Counter(
+                issue for item in questions for issue in item["issues"]
+            )),
             "requiresHumanReview": True,
             "paidApiUsed": False,
             "layoutPreserved": True,

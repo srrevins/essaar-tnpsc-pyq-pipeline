@@ -413,3 +413,52 @@ class DestroyedLabelTests(unittest.TestCase):
         texts = {item["label"]: item["text"] for item in options}
         self.assertEqual(texts["A"], "Hindi and Urdu")
         self.assertEqual(texts["B"], "Hindi and Sindhi")
+
+
+class QuestionIssueTests(unittest.TestCase):
+    """A question that failed to parse is worth more as a labelled gap."""
+
+    def build(self, **overrides):
+        question = {
+            "questionType": "standard",
+            "questionTextEn": "Which article of the Constitution abolishes untouchability?",
+            "questionTextTa": "இந்திய அரசியலமைப்பின் எந்த சரத்து?",
+            "options": [{"label": letter, "text": letter} for letter in "ABCDE"],
+        }
+        question.update(overrides)
+        return question
+
+    def test_a_fully_parsed_question_has_no_issues(self):
+        self.assertEqual(pipeline.question_issues(self.build()), [])
+
+    def test_missing_options_are_named(self):
+        self.assertIn("incomplete_options", pipeline.question_issues(
+            self.build(options=[{"label": letter, "text": letter} for letter in "ABCD"])))
+        self.assertIn("no_options_found", pipeline.question_issues(self.build(options=[])))
+
+    def test_a_short_structured_question_is_flagged_separately(self):
+        # The lettered list above a match-the-following is indistinguishable
+        # from the options once OCR has flattened it, so a short one probably
+        # never found the option block at all.
+        issues = pipeline.question_issues(self.build(
+            questionType="match_following",
+            options=[{"label": "A", "text": "1 2 3 4"}]))
+        self.assertIn("structured_layout_unresolved", issues)
+        # A complete one is not flagged just for being structured.
+        self.assertNotIn("structured_layout_unresolved",
+                         pipeline.question_issues(self.build(questionType="match_following")))
+
+    def test_missing_or_truncated_text_is_named(self):
+        self.assertIn("no_question_text", pipeline.question_issues(
+            self.build(questionTextEn="", questionTextTa="")))
+        self.assertIn("no_english_text", pipeline.question_issues(
+            self.build(questionTextEn="")))
+        self.assertIn("question_text_truncated", pipeline.question_issues(
+            self.build(questionTextEn="Match the")))
+
+    def test_issues_are_attached_to_every_parsed_question(self):
+        paper = pipeline.make_paper("Group I", 2021, "Preliminary", "objective", "General Studies", "https://example.test/p.pdf", "https://example.test", "test")
+        pages = [{"page": 1, "method": "embedded", "quality": 0.9, "text":
+                  "1. Which Article protects Fundamental Rights?\n(A) Article 12\n(B) Article 32\n(C) Article 40\n(D) Article 50\n(E) Answer not known\n"}]
+        questions = pipeline.parse_questions(pages, pipeline.asdict(paper))
+        self.assertEqual(questions[0]["issues"], [])
