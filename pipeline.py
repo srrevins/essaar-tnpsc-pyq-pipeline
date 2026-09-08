@@ -40,6 +40,10 @@ CHUNK_SIZE = 256 * 1024
 # Per page. Ample once Tesseract is pinned to one thread (about 3s a page);
 # generous enough that a genuinely hard page still gets a fair attempt.
 OCR_TIMEOUT = 180
+# Bump whenever a change alters what extraction produces. Drafts record the
+# version that made them, so stale ones are re-extracted automatically instead
+# of surviving because a file happens to exist at the right path.
+PARSER_VERSION = 2
 YEAR_RE = re.compile(r"\b(20(?:1[6-9]|2[0-6]))\b")
 GS_RE = re.compile(r"\b(?:general\s+stud(?:y|ies)|g\s*\.?\s*s\.?)\b", re.I)
 PDF_RE = re.compile(r"\.pdf(?:$|[?#])", re.I)
@@ -1233,6 +1237,7 @@ def extract_draft(pdf_path: Path, paper: dict, sha256: str, force_ocr: bool = Fa
     questions = parse_questions(pages, paper)
     return {
         "schemaVersion": 2,
+        "parserVersion": PARSER_VERSION,
         "paper": paper,
         "sourceSha256": sha256,
         "extraction": {
@@ -1341,6 +1346,14 @@ def sync_missing(manifest_path: Path, limit: int, start: int, force_ocr: bool) -
     return {"processed": completed, "skippedExisting": skipped, "failed": failed}
 
 
+def draft_is_current(draft_path: Path) -> bool:
+    """Whether an existing draft was made by the parser now in the tree."""
+    try:
+        return int(load_draft(draft_path).get("parserVersion", 1)) >= PARSER_VERSION
+    except (OSError, ValueError, gzip.BadGzipFile):
+        return False
+
+
 def extract_missing_to_directory(
     manifest_path: Path,
     output_root: Path,
@@ -1349,6 +1362,7 @@ def extract_missing_to_directory(
     force_ocr: bool,
     shard_index: int = 0,
     shard_count: int = 1,
+    refresh: bool = False,
 ) -> dict:
     if shard_count < 1 or shard_index < 0 or shard_index >= shard_count:
         raise ValueError("Invalid shard index/count")
@@ -1362,7 +1376,12 @@ def extract_missing_to_directory(
             if completed >= limit:
                 break
             draft_path = output_root / paper["draftPath"]
-            if draft_path.is_file() and draft_path.stat().st_size > 0:
+            if (
+                draft_path.is_file()
+                and draft_path.stat().st_size > 0
+                and not refresh
+                and draft_is_current(draft_path)
+            ):
                 skipped += 1
                 continue
             pdf_path = temp_dir / f"{paper['id']}.pdf"
@@ -1398,6 +1417,7 @@ def command_sync_github(args: argparse.Namespace) -> int:
         args.force_ocr,
         args.shard_index,
         args.shard_count,
+        args.refresh,
     )
     log(json.dumps(summary, indent=2))
     return 1 if summary["failed"] and not summary["processed"] else 0
@@ -1552,6 +1572,8 @@ def parser() -> argparse.ArgumentParser:
     github.add_argument("--force-ocr", action="store_true")
     github.add_argument("--shard-index", type=int, default=0)
     github.add_argument("--shard-count", type=int, default=1)
+    github.add_argument("--refresh", action="store_true",
+                        help="re-extract papers even when a current draft exists")
     github.set_defaults(handler=command_sync_github)
     scorecard = commands.add_parser("scorecard", help="report how completely extracted papers parsed")
     scorecard.add_argument("--drafts", type=Path, default=ROOT / "data" / "drafts")
