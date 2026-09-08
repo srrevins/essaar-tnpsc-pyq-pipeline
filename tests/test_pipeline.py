@@ -29,8 +29,11 @@ class PipelineTests(unittest.TestCase):
         }]
         questions = pipeline.parse_questions(pages, pipeline.asdict(paper))
         self.assertEqual([item["questionNumber"] for item in questions], [1, 2])
-        self.assertEqual(questions[0]["subject"], "Indian Polity")
-        self.assertEqual(questions[1]["subject"], "Indian Economy")
+        # Unit names are the official ones, so they match the site's taxonomy.
+        self.assertEqual(questions[0]["subject"], "Unit 5: Indian Polity")
+        self.assertEqual(questions[1]["subject"], "Unit 6: Indian Economy")
+        # And a subtopic is now produced, not just a unit.
+        self.assertNotEqual(questions[0]["subtopic"], "Unmapped subtopic")
         # Answers come from the official final key, never from the paper text.
         self.assertEqual(questions[0]["correctOption"], "")
 
@@ -316,3 +319,57 @@ class AnswerKeyJoinTests(unittest.TestCase):
         # The key is authoritative; the hint only lowers confidence for review.
         self.assertEqual(conflicting[0]["correctOption"], "C")
         self.assertEqual(conflicting[0]["confidence"]["answer"], 0.5)
+
+
+class SyllabusTaggerTests(unittest.TestCase):
+    TAGS = [
+        {"unitId": "unit-4", "subject": "Unit 4: History and Culture of India",
+         "subtopic": "Art and Architecture", "keywords": ["art", "temple architecture", "chola"]},
+        {"unitId": "unit-5", "subject": "Unit 5: Indian Polity",
+         "subtopic": "Fundamental Rights", "keywords": ["fundamental rights", "article 32", "writ"]},
+    ]
+
+    def test_matches_whole_words_only(self):
+        # Substring matching pulled any question mentioning a part, a chart or
+        # the Charter Act into "Art and Architecture".
+        result = pipeline.tag_question("Which part of the chart shows the Charter Act?", self.TAGS)
+        self.assertEqual(result["unitId"], "unmapped")
+
+    def test_assigns_a_subtopic_not_just_a_unit(self):
+        result = pipeline.tag_question(
+            "Which article guarantees fundamental rights, and which writ enforces them?", self.TAGS)
+        self.assertEqual(result["subject"], "Unit 5: Indian Polity")
+        self.assertEqual(result["subtopic"], "Fundamental Rights")
+        self.assertGreaterEqual(result["confidence"], pipeline.TAG_CONFIDENCE_FLOOR)
+
+    def test_one_short_incidental_word_is_not_a_topic(self):
+        result = pipeline.tag_question("A discussion of art.", self.TAGS)
+        self.assertEqual(result["unitId"], "unmapped")
+        # What was matched is still reported, so a near miss can be reviewed.
+        self.assertEqual(result["matchedKeywords"], ["art"])
+
+    def test_a_long_keyword_carries_more_weight_than_a_short_one(self):
+        short = pipeline.tag_question("art", self.TAGS)["confidence"]
+        long = pipeline.tag_question("temple architecture", self.TAGS)["confidence"]
+        self.assertGreater(long, short)
+
+    def test_empty_text_is_unmapped(self):
+        self.assertEqual(pipeline.tag_question("   ", self.TAGS)["unitId"], "unmapped")
+
+    def test_shipped_config_covers_every_prelims_unit_with_subtopics(self):
+        tags = pipeline.load_tags()
+        units = {entry["unitId"] for entry in tags}
+        self.assertEqual(len(units), 10)
+        self.assertTrue(all(entry["subtopic"] for entry in tags))
+        self.assertGreater(sum(len(entry["keywords"]) for entry in tags), 800)
+
+    def test_an_older_flat_config_still_loads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tags.json"
+            path.write_text(json.dumps([
+                {"unitId": "unit-1", "subject": "General Science", "keywords": ["physics"]}
+            ]), encoding="utf-8")
+            with mock.patch.object(pipeline, "TAG_CONFIG", path):
+                tags = pipeline.load_tags()
+        self.assertEqual(tags[0]["subtopic"], "")
+        self.assertEqual(tags[0]["unitId"], "unit-1")
