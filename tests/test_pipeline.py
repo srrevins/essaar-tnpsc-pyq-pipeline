@@ -107,16 +107,60 @@ class PipelineTests(unittest.TestCase):
                 destination.write_bytes(b"%PDF-test")
                 return "abc123"
 
-            fake_draft = {"schemaVersion": 1, "questions": [], "paper": pipeline.asdict(paper)}
+            fake_draft = {
+                "schemaVersion": 2,
+                "parserVersion": pipeline.PARSER_VERSION,
+                "questions": [],
+                "paper": pipeline.asdict(paper),
+            }
             with mock.patch.object(pipeline, "download_pdf", side_effect=fake_download), mock.patch.object(pipeline, "extract_draft", return_value=fake_draft):
                 first = pipeline.extract_missing_to_directory(manifest, root / "data", 1, 0, False)
                 second = pipeline.extract_missing_to_directory(manifest, root / "data", 1, 0, False)
+                forced = pipeline.extract_missing_to_directory(manifest, root / "data", 1, 0, False, refresh=True)
 
             output = root / "data" / paper.draftPath
             self.assertEqual(first["processed"], 1)
+            # A draft made by the parser now in the tree is left alone.
             self.assertEqual(second["skippedExisting"], 1)
+            # --refresh overrides that.
+            self.assertEqual(forced["processed"], 1)
             self.assertEqual(json.loads(gzip.decompress(output.read_bytes())), fake_draft)
             self.assertFalse(output.with_suffix(output.suffix + ".part").exists())
+
+    def test_a_draft_from_an_older_parser_is_re_extracted(self):
+        paper = pipeline.make_paper("Group IV", 2023, "Preliminary", "objective", "General Studies", "https://example.test/old.pdf", "https://example.test", "test")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(pipeline.manifest_payload([paper])), encoding="utf-8")
+
+            # What the archive holds today: drafts written before parserVersion
+            # existed, by a parser that could not recover options or answers.
+            stale = root / "data" / paper.draftPath
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_bytes(gzip.compress(json.dumps(
+                {"schemaVersion": 2, "questions": [], "paper": pipeline.asdict(paper)}
+            ).encode("utf-8")))
+            self.assertFalse(pipeline.draft_is_current(stale))
+
+            def fake_download(_session, _url, destination):
+                destination.write_bytes(b"%PDF-test")
+                return "abc123"
+
+            fresh = {"schemaVersion": 2, "parserVersion": pipeline.PARSER_VERSION,
+                     "questions": [], "paper": pipeline.asdict(paper)}
+            with mock.patch.object(pipeline, "download_pdf", side_effect=fake_download), mock.patch.object(pipeline, "extract_draft", return_value=fresh):
+                summary = pipeline.extract_missing_to_directory(manifest, root / "data", 1, 0, False)
+
+            self.assertEqual(summary["processed"], 1)
+            self.assertEqual(summary["skippedExisting"], 0)
+            self.assertTrue(pipeline.draft_is_current(stale))
+
+    def test_an_unreadable_draft_counts_as_stale(self):
+        with tempfile.TemporaryDirectory() as temp:
+            broken = Path(temp) / "broken.json.gz"
+            broken.write_bytes(b"not gzip at all")
+            self.assertFalse(pipeline.draft_is_current(broken))
 
     def test_manifest_validation_rejects_duplicate_url(self):
         paper = pipeline.make_paper("Group I", 2024, "Preliminary", "objective", "General Studies", "https://example.test/paper.pdf", "https://example.test", "test")
