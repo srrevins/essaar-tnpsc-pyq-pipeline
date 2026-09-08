@@ -819,14 +819,35 @@ def parse_options(region: str) -> tuple[list[dict], set[str], float]:
         # option it belongs to.
         candidates = [m.span() for m in LOOSE_LABEL_RE.finditer(region, start, end)]
         chosen = candidates[-len(run):] if candidates else []
-        offset = len(run) - len(chosen)
+
+        outstanding = len(run) - len(chosen)
+        if outstanding > 0:
+            # Nothing label-shaped survived for these. TNPSC sets an option on
+            # its own line whenever it is long, so a line break inside the gap
+            # is where the next option begins - a far better boundary than the
+            # junk the highlighter left in place of the label.
+            limit = chosen[0][0] if chosen else end
+            breaks = [
+                start + match.end()
+                for match in re.finditer("\n", region[start:end])
+                if start + match.end() < limit
+            ]
+            if len(breaks) >= outstanding:
+                chosen = [(offset, offset) for offset in breaks[-outstanding:]] + chosen
+                outstanding = 0
+
         for position, letter in enumerate(run):
-            if position < offset:
-                # No label survived for this one; its text simply starts here.
+            if position < outstanding:
+                # Not even a line break to go on; the text simply starts here.
                 anchors[letter] = (start, start)
                 lost.add(letter)
             else:
-                anchors[letter] = chosen[position - offset]
+                span = chosen[position - outstanding]
+                anchors[letter] = span
+                if span[0] == span[1]:
+                    # A boundary, not a label: OCR's junk is still at the head
+                    # of the text and has to be trimmed off.
+                    lost.add(letter)
             recovered.add(letter)
 
     options: list[dict] = []
