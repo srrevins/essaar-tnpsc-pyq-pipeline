@@ -37,6 +37,9 @@ START_YEAR = 2016
 END_YEAR = 2026
 TIMEOUT = (20, 120)
 CHUNK_SIZE = 256 * 1024
+# Per page. Ample once Tesseract is pinned to one thread (about 3s a page);
+# generous enough that a genuinely hard page still gets a fair attempt.
+OCR_TIMEOUT = 180
 YEAR_RE = re.compile(r"\b(20(?:1[6-9]|2[0-6]))\b")
 GS_RE = re.compile(r"\b(?:general\s+stud(?:y|ies)|g\s*\.?\s*s\.?)\b", re.I)
 PDF_RE = re.compile(r"\.pdf(?:$|[?#])", re.I)
@@ -536,15 +539,28 @@ def ocr_page(page: fitz.Page, temp_dir: Path) -> str:
     pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
     image_path = temp_dir / f"page-{page.number + 1:04d}.png"
     pix.save(image_path)
-    result = subprocess.run(
-        ["tesseract", str(image_path), "stdout", "-l", "eng+tam", "--psm", "6"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=180,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["tesseract", str(image_path), "stdout", "-l", "eng+tam", "--psm", "6"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=OCR_TIMEOUT,
+            # Tesseract uses OpenMP and will take every core it can find. Left
+            # alone, parallel extraction oversubscribes the machine so badly
+            # that pages exceed the timeout below: three extractions on four
+            # cores drove the load average near twelve and killed half the
+            # papers. One thread each is both faster in aggregate and
+            # predictable, which matters most under the sharded workflow.
+            env={**os.environ, "OMP_THREAD_LIMIT": "1"},
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # A page that will not OCR is a gap in one paper, not a reason to lose
+        # the other hundred pages of it.
+        log(f"OCR timed out on page {page.number + 1} after {OCR_TIMEOUT}s")
+        return ""
     return result.stdout if result.returncode == 0 else ""
 
 
@@ -1426,6 +1442,86 @@ def command_sync(args: argparse.Namespace) -> int:
     return 1 if summary["failed"] and not summary["processed"] else 0
 
 
+def load_draft(path: Path) -> dict:
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def build_scorecard(draft_root: Path) -> dict:
+    """Summarise how completely each extracted paper parsed.
+
+    The point of this is to decide what may be published. A paper is only
+    worth promoting when its questions came out whole, so the report counts
+    questions with no issues rather than questions found, and lists the issues
+    holding the rest back.
+    """
+    papers: list[dict] = []
+    totals: Counter = Counter()
+    issues: Counter = Counter()
+
+    for path in sorted(draft_root.rglob("*.json*")):
+        try:
+            draft = load_draft(path)
+        except (OSError, ValueError, gzip.BadGzipFile):
+            papers.append({"path": str(path), "error": "unreadable"})
+            continue
+        questions = draft.get("questions") or []
+        if not questions:
+            papers.append({"path": str(path), "error": "no questions"})
+            continue
+
+        clean = sum(1 for item in questions if not item.get("issues"))
+        answered = sum(1 for item in questions if item.get("acceptedOptions"))
+        tagged = sum(
+            1 for item in questions
+            if item.get("subtopic") not in (None, "", "Unmapped subtopic")
+        )
+        for item in questions:
+            issues.update(item.get("issues") or [])
+        totals["questions"] += len(questions)
+        totals["clean"] += clean
+        totals["answered"] += answered
+        totals["tagged"] += tagged
+        totals["papers"] += 1
+
+        paper = draft.get("paper") or {}
+        papers.append({
+            "id": paper.get("id", path.stem),
+            "year": paper.get("year"),
+            "examGroup": paper.get("examGroup"),
+            "questions": len(questions),
+            "clean": clean,
+            "answered": answered,
+            "tagged": tagged,
+            "cleanRate": round(clean / len(questions), 3),
+        })
+
+    papers.sort(key=lambda item: item.get("cleanRate", -1), reverse=True)
+    return {
+        "generatedFrom": str(draft_root),
+        "totals": dict(totals),
+        "cleanRate": round(totals["clean"] / totals["questions"], 3) if totals["questions"] else 0.0,
+        "issueCounts": dict(issues.most_common()),
+        "papers": papers,
+    }
+
+
+def command_scorecard(args: argparse.Namespace) -> int:
+    report = build_scorecard(args.drafts)
+    if args.output:
+        write_json(args.output, report)
+        log(f"Wrote scorecard to {args.output}")
+    totals = report["totals"]
+    log(f"papers {totals.get('papers', 0)} | questions {totals.get('questions', 0)} "
+        f"| complete {totals.get('clean', 0)} ({report['cleanRate']:.1%}) "
+        f"| answered {totals.get('answered', 0)} | tagged {totals.get('tagged', 0)}")
+    for issue, count in report["issueCounts"].items():
+        log(f"  {issue}: {count}")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -1457,6 +1553,10 @@ def parser() -> argparse.ArgumentParser:
     github.add_argument("--shard-index", type=int, default=0)
     github.add_argument("--shard-count", type=int, default=1)
     github.set_defaults(handler=command_sync_github)
+    scorecard = commands.add_parser("scorecard", help="report how completely extracted papers parsed")
+    scorecard.add_argument("--drafts", type=Path, default=ROOT / "data" / "drafts")
+    scorecard.add_argument("--output", type=Path)
+    scorecard.set_defaults(handler=command_scorecard)
     return root
 
 
