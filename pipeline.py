@@ -43,7 +43,7 @@ OCR_TIMEOUT = 180
 # Bump whenever a change alters what extraction produces. Drafts record the
 # version that made them, so stale ones are re-extracted automatically instead
 # of surviving because a file happens to exist at the right path.
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 YEAR_RE = re.compile(r"\b(20(?:1[6-9]|2[0-6]))\b")
 GS_RE = re.compile(r"\b(?:general\s+stud(?:y|ies)|g\s*\.?\s*s\.?)\b", re.I)
 PDF_RE = re.compile(r"\.pdf(?:$|[?#])", re.I)
@@ -74,6 +74,20 @@ LOOSE_LABEL_RE = re.compile(r"[(\[][^\s()\[\]]{0,3}[)\]\-]|[@©®]")
 # The English (E) option is fixed text on every paper and marks the end of the
 # English half of a bilingual question.
 EN_TAIL_RE = re.compile(r"answer\s*not\s*known", re.I)
+
+# The cover page of every booklet carries numbered instructions - "this booklet
+# contains 100 questions", "write your Question Booklet Number on the answer
+# sheet" - which look exactly like numbered questions to the parser. They are
+# counted as questions that failed to parse, which drags down every paper's
+# completeness. Only ever applied to a block with no options at all, so a real
+# question mentioning an answer sheet is never dropped.
+INSTRUCTION_RE = re.compile(
+    r"வினாத்\s*தொகுப்பு|விடைத்\s*தாள்|அறிவுரை|தேர்வாணைய|வினாத்\s*தாள்\s*எண்"
+    r"|விடை\s*வட்டங்கள்|கரும்\s*பென்சில்|தேர்வர்\s*கவனத்திற்கு"
+    r"|question\s+booklet|answer\s+sheet|omr\s+sheet|instructions?\s+to\s+the\s+candidate"
+    r"|do\s+not\s+open|rough\s+work|invigilator|serial\s+number\s+of\s+this",
+    re.I,
+)
 
 # TNPSC publishes a separate one-page final answer key: a typed grid of five
 # (S.No, Key) column pairs. A cell holds one letter, several separated by
@@ -754,6 +768,12 @@ def question_layout(question_text: str) -> dict:
         "rawLines": raw_lines,
         "structured": structured,
     }
+
+
+def _has_option_labels(block: str) -> bool:
+    return sum(1 for letter in OPTION_LETTERS if EXACT_LABEL_RE[letter].search(block)) >= 2
+
+
 def split_bilingual(block: str) -> tuple[str, str]:
     """Split a question block into its English and Tamil halves.
 
@@ -959,6 +979,9 @@ def parse_questions(pages: list[dict], paper: dict) -> list[dict]:
             block = text[match.end():end].strip()
             if len(block) < 15:
                 continue
+            if not _has_option_labels(block) and INSTRUCTION_RE.search(block):
+                # Cover-page instructions, not a question.
+                continue
             english_half, tamil_half = split_bilingual(block)
             english_stem, english_options, english_marks, english_score = parse_half(english_half)
             tamil_stem, tamil_options, _, tamil_score = parse_half(tamil_half)
@@ -1044,7 +1067,11 @@ def question_issues(question: dict) -> list[str]:
         issues.append("no_question_text")
     elif not english:
         issues.append("no_english_text")
-    elif len(english) < 25:
+    elif len(english) < 12 or (len(english) < 25 and count < len(OPTION_LETTERS)):
+        # A stem this short is a fragment however good the options are. Between
+        # 12 and 25 characters it is only suspicious when the options are also
+        # incomplete: "Saki is the pen name of" with five clean options is a
+        # real question, not a truncated one.
         issues.append("question_text_truncated")
 
     return issues

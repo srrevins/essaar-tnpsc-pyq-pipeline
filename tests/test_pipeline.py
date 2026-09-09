@@ -579,3 +579,52 @@ class OcrRobustnessTests(unittest.TestCase):
              mock.patch.object(pipeline.subprocess, "run",
                                side_effect=pipeline.subprocess.TimeoutExpired("tesseract", 180)):
             self.assertEqual(pipeline.ocr_page(self._page(), Path(tempfile.gettempdir())), "")
+
+
+class CoverPageTests(unittest.TestCase):
+    """The cover page's numbered instructions are not questions."""
+
+    PAPER = None
+
+    def parse(self, text):
+        paper = pipeline.make_paper("Group IV", 2024, "Preliminary", "objective", "General Studies", "https://example.test/p.pdf", "https://example.test", "test")
+        return pipeline.parse_questions(
+            [{"page": 1, "method": "embedded", "quality": 0.9, "text": text}],
+            pipeline.asdict(paper))
+
+    def test_instruction_blocks_are_not_counted_as_questions(self):
+        text = (
+            "1. This question booklet contains 100 questions. Check that all pages are present\n"
+            "2. Write your Question Booklet Number on the answer sheet in the space provided\n"
+            "3. Which Article of the Constitution abolishes untouchability?\n"
+            "(A) Article 16\n(B) Article 17\n(C) Article 18\n(D) Article 19\n(E) Answer not known\n"
+        )
+        questions = self.parse(text)
+        self.assertEqual([item["questionNumber"] for item in questions], [3])
+
+    def test_tamil_instructions_are_recognised_however_they_are_spaced(self):
+        # OCR splits the compound word unpredictably, so the pattern tolerates it.
+        for phrase in ("இந்த வினாத்தொகுப்பு 100 வினாக்களைக் கொண்டுள்ளது",
+                       "இந்த வினாத் தொகுப்பு 100 வினாக்களைக் கொண்டுள்ளது"):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(pipeline.INSTRUCTION_RE.search(phrase))
+
+    def test_a_real_question_mentioning_an_answer_sheet_survives(self):
+        # The filter only ever applies to a block with no options at all.
+        text = ("1. Which body prescribes the answer sheet format for public examinations?\n"
+                "(A) TNPSC\n(B) UPSC\n(C) SSC\n(D) RRB\n(E) Answer not known\n")
+        self.assertEqual(len(self.parse(text)), 1)
+
+    def test_a_fragment_is_flagged_even_with_a_full_option_set(self):
+        # Below the fragment band no option set rescues the stem.
+        fragment = {"questionType": "standard", "questionTextEn": "Match the",
+                    "questionTextTa": "", "options": [{"label": l, "text": l} for l in "ABCDE"]}
+        self.assertIn("question_text_truncated", pipeline.question_issues(fragment))
+
+    def test_a_short_question_with_a_full_option_set_is_not_flagged(self):
+        # "Saki is the pen name of" is a real question, not a truncated one.
+        short = {"questionType": "standard", "questionTextEn": "Saki is the pen name of",
+                 "questionTextTa": "", "options": [{"label": l, "text": l} for l in "ABCDE"]}
+        self.assertNotIn("question_text_truncated", pipeline.question_issues(short))
+        short["options"] = short["options"][:3]
+        self.assertIn("question_text_truncated", pipeline.question_issues(short))
